@@ -1,6 +1,16 @@
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+import json
+
+import httpx
+
+from scanner.config import MASSIVE_API_KEY
+from scanner.data import BASE_URL
+
+
+CACHE_DIR = Path("data/corporate_actions")
 
 
 @dataclass
@@ -10,6 +20,7 @@ class CorporateActionEvent:
     split_from: float | None = None
     split_to: float | None = None
     ticker: str | None = None
+    historical_adjustment_factor: float | None = None
     raw: dict[str, Any] | None = None
 
 
@@ -40,23 +51,6 @@ def classify_split(
     split_from: float,
     split_to: float,
 ) -> str:
-    """
-    Classify a split from Massive-style split terms.
-
-    Examples:
-
-        1 -> 5
-        shareholder receives 5 shares for each 1
-        = FORWARD_SPLIT
-
-        10 -> 1
-        ten old shares become one new share
-        = REVERSE_SPLIT
-
-        1 -> 1
-        = NEUTRAL_SPLIT
-    """
-
     split_from = float(split_from)
     split_to = float(split_to)
 
@@ -80,16 +74,6 @@ def split_adjustment_factor(
     split_from: float,
     split_to: float,
 ) -> float:
-    """
-    Return the share-count adjustment factor.
-
-    1-for-5 style forward split:
-        1 -> 5 = 5.0
-
-    10-for-1 reverse split:
-        10 -> 1 = 0.1
-    """
-
     split_from = float(split_from)
     split_to = float(split_to)
 
@@ -104,14 +88,6 @@ def split_adjustment_factor(
 def parse_split_event(
     raw: dict[str, Any],
 ) -> CorporateActionEvent:
-    """
-    Convert a split record into our internal format.
-
-    Accepts common field names so the research
-    layer does not depend tightly on one API
-    response representation.
-    """
-
     execution_date = (
         raw.get("execution_date")
         or raw.get("ex_date")
@@ -132,10 +108,33 @@ def parse_split_event(
             "and split_to."
         )
 
-    event_type = classify_split(
-        split_from=split_from,
-        split_to=split_to,
+    api_adjustment_type = raw.get(
+        "adjustment_type"
     )
+
+    if api_adjustment_type == "reverse_split":
+        event_type = "REVERSE_SPLIT"
+
+    elif api_adjustment_type == "forward_split":
+        event_type = "FORWARD_SPLIT"
+
+    elif api_adjustment_type == "stock_dividend":
+        event_type = "STOCK_DIVIDEND"
+
+    else:
+        event_type = classify_split(
+            split_from=split_from,
+            split_to=split_to,
+        )
+
+    historical_factor = raw.get(
+        "historical_adjustment_factor"
+    )
+
+    if historical_factor is not None:
+        historical_factor = float(
+            historical_factor
+        )
 
     return CorporateActionEvent(
         event_type=event_type,
@@ -145,8 +144,215 @@ def parse_split_event(
         split_from=float(split_from),
         split_to=float(split_to),
         ticker=raw.get("ticker"),
+        historical_adjustment_factor=(
+            historical_factor
+        ),
         raw=raw,
     )
+
+
+def _cache_path(
+    ticker: str,
+) -> Path:
+    ticker = ticker.upper().strip()
+
+    return (
+        CACHE_DIR
+        / f"{ticker}_splits.json"
+    )
+
+
+def _load_split_cache(
+    ticker: str,
+) -> list[dict[str, Any]] | None:
+    path = _cache_path(
+        ticker
+    )
+
+    if not path.exists():
+        return None
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+            payload = json.load(f)
+
+        if not isinstance(
+            payload,
+            list,
+        ):
+            return None
+
+        return payload
+
+    except Exception:
+        return None
+
+
+def _save_split_cache(
+    ticker: str,
+    splits: list[dict[str, Any]],
+) -> None:
+    CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path = _cache_path(
+        ticker
+    )
+
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            splits,
+            f,
+            indent=2,
+        )
+
+
+def get_stock_splits(
+    ticker: str,
+    force_refresh: bool = False,
+) -> list[CorporateActionEvent]:
+    """
+    Retrieve all known Massive split events for
+    one ticker.
+
+    Uses the current:
+        GET /stocks/v1/splits
+
+    Results are cached locally so historical
+    replays do not repeatedly hit the endpoint.
+    """
+
+    ticker = (
+        ticker
+        .upper()
+        .strip()
+    )
+
+    if not ticker:
+        raise ValueError(
+            "Ticker cannot be empty."
+        )
+
+    if not force_refresh:
+        cached = _load_split_cache(
+            ticker
+        )
+
+        if cached is not None:
+            return [
+                parse_split_event(
+                    item
+                )
+                for item in cached
+            ]
+
+    url = (
+        f"{BASE_URL}"
+        "/stocks/v1/splits"
+    )
+
+    params = {
+        "ticker": ticker,
+        "limit": 1000,
+        "sort": "execution_date.asc",
+        "apiKey": MASSIVE_API_KEY,
+    }
+
+    raw_splits = []
+
+    # Hard bound protects us from another
+    # accidental pagination nightmare.
+    max_pages = 20
+    page = 0
+
+    with httpx.Client(
+        timeout=60.0
+    ) as client:
+
+        while url:
+            page += 1
+
+            if page > max_pages:
+                raise RuntimeError(
+                    "Split pagination exceeded "
+                    f"{max_pages} pages for {ticker}."
+                )
+
+            response = client.get(
+                url,
+                params=params,
+            )
+
+            response.raise_for_status()
+
+            payload = response.json()
+
+            status = payload.get(
+                "status"
+            )
+
+            if status not in {
+                "OK",
+                "DELAYED",
+            }:
+                raise RuntimeError(
+                    "Massive returned an unexpected "
+                    f"split response for {ticker}: "
+                    f"{payload}"
+                )
+
+            results = payload.get(
+                "results",
+                [],
+            )
+
+            raw_splits.extend(
+                results
+            )
+
+            next_url = payload.get(
+                "next_url"
+            )
+
+            if not next_url:
+                break
+
+            # Massive next_url may omit the key.
+            separator = (
+                "&"
+                if "?" in next_url
+                else "?"
+            )
+
+            if "apiKey=" not in next_url:
+                next_url = (
+                    f"{next_url}"
+                    f"{separator}"
+                    f"apiKey={MASSIVE_API_KEY}"
+                )
+
+            url = next_url
+            params = None
+
+    _save_split_cache(
+        ticker,
+        raw_splits,
+    )
+
+    return [
+        parse_split_event(
+            item
+        )
+        for item in raw_splits
+    ]
 
 
 def find_nearby_actions(
@@ -155,44 +361,37 @@ def find_nearby_actions(
     lookback_days: int = 10,
     lookforward_days: int = 3,
 ) -> list[CorporateActionEvent]:
-    """
-    Find corporate actions near a signal.
-
-    We deliberately allow a small look-forward
-    window ONLY for research-quality diagnostics.
-
-    IMPORTANT:
-    A future corporate action found here must never
-    be used as an input feature for a historical
-    trading signal.
-
-    This function is for contamination/sanity checks,
-    not signal generation.
-    """
-
     signal_date = _normalize_date(
         signal_date
     )
 
     start = (
         signal_date
-        - timedelta(days=lookback_days)
+        - timedelta(
+            days=lookback_days
+        )
     )
 
     end = (
         signal_date
-        + timedelta(days=lookforward_days)
+        + timedelta(
+            days=lookforward_days
+        )
     )
 
     return sorted(
         [
             action
             for action in actions
-            if start
-            <= action.execution_date
-            <= end
+            if (
+                start
+                <= action.execution_date
+                <= end
+            )
         ],
-        key=lambda action: action.execution_date,
+        key=lambda action: (
+            action.execution_date
+        ),
     )
 
 
@@ -203,24 +402,6 @@ def check_corporate_action_risk(
     return_5d: float | None = None,
     return_20d: float | None = None,
 ) -> CorporateActionCheck:
-    """
-    Determine whether a historical anomaly may be
-    contaminated by a corporate action.
-
-    V1 policy:
-
-    - Nearby reverse split:
-        flag and exclude from clean research sample.
-
-    - Nearby forward split:
-        flag, but do not automatically exclude.
-
-    - Extremely large observed return:
-        flag for corporate-action verification.
-
-    This is intentionally conservative.
-    """
-
     nearby = find_nearby_actions(
         signal_date=signal_date,
         actions=actions,
@@ -231,8 +412,15 @@ def check_corporate_action_risk(
     exclude = False
 
     for action in nearby:
-        if action.event_type == "REVERSE_SPLIT":
-            if "RECENT_REVERSE_SPLIT" not in flags:
+
+        if (
+            action.event_type
+            == "REVERSE_SPLIT"
+        ):
+            if (
+                "RECENT_REVERSE_SPLIT"
+                not in flags
+            ):
                 flags.append(
                     "RECENT_REVERSE_SPLIT"
                 )
@@ -244,8 +432,14 @@ def check_corporate_action_risk(
 
             exclude = True
 
-        elif action.event_type == "FORWARD_SPLIT":
-            if "RECENT_FORWARD_SPLIT" not in flags:
+        elif (
+            action.event_type
+            == "FORWARD_SPLIT"
+        ):
+            if (
+                "RECENT_FORWARD_SPLIT"
+                not in flags
+            ):
                 flags.append(
                     "RECENT_FORWARD_SPLIT"
                 )
@@ -255,20 +449,50 @@ def check_corporate_action_risk(
                 "the anomaly signal."
             )
 
+        elif (
+            action.event_type
+            == "STOCK_DIVIDEND"
+        ):
+            if (
+                "RECENT_STOCK_DIVIDEND"
+                not in flags
+            ):
+                flags.append(
+                    "RECENT_STOCK_DIVIDEND"
+                )
+
+            reasons.append(
+                "A stock dividend occurred near "
+                "the anomaly signal."
+            )
+
     extreme_move = any(
         value is not None
         and abs(float(value)) >= threshold
         for value, threshold in [
-            (return_1d, 100),
-            (return_5d, 300),
-            (return_20d, 500),
+            (
+                return_1d,
+                100,
+            ),
+            (
+                return_5d,
+                300,
+            ),
+            (
+                return_20d,
+                500,
+            ),
         ]
     )
 
     if extreme_move:
-        flags.append(
+        if (
             "EXTREME_MOVE_NEEDS_CA_CHECK"
-        )
+            not in flags
+        ):
+            flags.append(
+                "EXTREME_MOVE_NEEDS_CA_CHECK"
+            )
 
         reasons.append(
             "Observed return is extreme enough "
