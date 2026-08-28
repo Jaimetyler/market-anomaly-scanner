@@ -1,6 +1,14 @@
+from __future__ import annotations
+
+from datetime import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+REGULAR_MARKET_CLOSE = time(16, 0)
 
 
 # ============================================================
@@ -125,13 +133,17 @@ def return_over_sessions(
     """
 
     if sessions <= 0:
-        raise ValueError("sessions must be greater than zero.")
+        raise ValueError(
+            "sessions must be greater than zero."
+        )
 
     if len(closes) <= sessions:
         return None
 
     current = float(closes.iloc[-1])
-    previous = float(closes.iloc[-1 - sessions])
+    previous = float(
+        closes.iloc[-1 - sessions]
+    )
 
     return percent_change(
         current=current,
@@ -152,7 +164,9 @@ def sma(
     """
 
     if period <= 0:
-        raise ValueError("period must be greater than zero.")
+        raise ValueError(
+            "period must be greater than zero."
+        )
 
     if len(series) < period:
         return None
@@ -208,7 +222,9 @@ def average_volume(
     """
 
     if period <= 0:
-        raise ValueError("period must be greater than zero.")
+        raise ValueError(
+            "period must be greater than zero."
+        )
 
     if exclude_current:
         series = volumes.iloc[:-1]
@@ -247,6 +263,84 @@ def relative_volume(
 
 
 # ============================================================
+# WILDER SMOOTHING
+# ============================================================
+
+def wilder_smoothed_series(
+    values: pd.Series,
+    period: int,
+) -> pd.Series:
+    """
+    Calculate a Wilder-smoothed series.
+
+    Wilder's method differs from simply calling pandas ewm().
+    The initial value is the arithmetic mean of the first
+    `period` valid observations.
+
+    Every subsequent value is:
+
+        ((previous * (period - 1)) + current) / period
+
+    The returned Series uses the same index as the input.
+    Values before the initial seed are NaN.
+    """
+
+    if period <= 0:
+        raise ValueError(
+            "period must be greater than zero."
+        )
+
+    numeric = pd.to_numeric(
+        values,
+        errors="coerce",
+    ).astype(float)
+
+    result = pd.Series(
+        float("nan"),
+        index=numeric.index,
+        dtype="float64",
+    )
+
+    valid_positions = [
+        position
+        for position, value in enumerate(
+            numeric.tolist()
+        )
+        if not pd.isna(value)
+    ]
+
+    if len(valid_positions) < period:
+        return result
+
+    seed_positions = valid_positions[:period]
+
+    seed = float(
+        numeric.iloc[seed_positions].mean()
+    )
+
+    seed_position = seed_positions[-1]
+    result.iloc[seed_position] = seed
+
+    previous = seed
+
+    for position in valid_positions[period:]:
+        current = float(
+            numeric.iloc[position]
+        )
+
+        previous = (
+            (
+                previous * (period - 1)
+            )
+            + current
+        ) / period
+
+        result.iloc[position] = previous
+
+    return result
+
+
+# ============================================================
 # RSI
 # ============================================================
 
@@ -255,37 +349,53 @@ def rsi(
     period: int = 14,
 ) -> float | None:
     """
-    Calculate RSI using Wilder-style exponential smoothing.
+    Calculate RSI using Wilder's original smoothing method.
+
+    The initial average gain and average loss are simple
+    arithmetic averages of the first `period` price changes.
+
+    Subsequent averages use Wilder's recursive smoothing.
     """
 
     if period <= 0:
-        raise ValueError("period must be greater than zero.")
+        raise ValueError(
+            "period must be greater than zero."
+        )
+
+    closes = pd.to_numeric(
+        closes,
+        errors="coerce",
+    ).astype(float)
 
     if len(closes) < period + 1:
         return None
 
-    delta = closes.diff()
+    if closes.isna().any():
+        return None
+
+    delta = closes.diff().iloc[1:]
 
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
 
-    avg_gain = gains.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
+    avg_gain_series = wilder_smoothed_series(
+        gains,
+        period,
+    )
 
-    avg_loss = losses.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
+    avg_loss_series = wilder_smoothed_series(
+        losses,
+        period,
+    )
 
-    gain = avg_gain.iloc[-1]
-    loss = avg_loss.iloc[-1]
+    gain = avg_gain_series.iloc[-1]
+    loss = avg_loss_series.iloc[-1]
 
     if pd.isna(gain) or pd.isna(loss):
         return None
+
+    if gain == 0 and loss == 0:
+        return 50.0
 
     if loss == 0:
         return 100.0
@@ -295,7 +405,9 @@ def rsi(
 
     rs = gain / loss
 
-    value = 100 - (100 / (1 + rs))
+    value = 100 - (
+        100 / (1 + rs)
+    )
 
     return float(value)
 
@@ -315,6 +427,9 @@ def true_range_series(
         high - low
         abs(high - previous close)
         abs(low - previous close)
+
+    For the first bar, where no previous close exists,
+    high - low is used.
     """
 
     previous_close = df["close"].shift(1)
@@ -322,8 +437,14 @@ def true_range_series(
     ranges = pd.concat(
         [
             df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
+            (
+                df["high"]
+                - previous_close
+            ).abs(),
+            (
+                df["low"]
+                - previous_close
+            ).abs(),
         ],
         axis=1,
     )
@@ -331,29 +452,55 @@ def true_range_series(
     return ranges.max(axis=1)
 
 
+def atr_series(
+    df: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
+    """
+    Calculate the full Wilder ATR series.
+
+    The first ATR is the arithmetic mean of the first
+    `period` True Range observations.
+
+    Each later ATR uses Wilder's recursive smoothing.
+    """
+
+    if period <= 0:
+        raise ValueError(
+            "period must be greater than zero."
+        )
+
+    true_range = true_range_series(df)
+
+    return wilder_smoothed_series(
+        true_range,
+        period,
+    )
+
+
 def atr(
     df: pd.DataFrame,
     period: int = 14,
 ) -> float | None:
     """
-    Calculate Average True Range using Wilder-style smoothing.
+    Calculate Average True Range using Wilder's
+    original smoothing method.
     """
 
     if period <= 0:
-        raise ValueError("period must be greater than zero.")
+        raise ValueError(
+            "period must be greater than zero."
+        )
 
-    if len(df) < period + 1:
+    if len(df) < period:
         return None
 
-    true_range = true_range_series(df)
+    series = atr_series(
+        df,
+        period=period,
+    )
 
-    atr_series = true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    value = atr_series.iloc[-1]
+    value = series.iloc[-1]
 
     if pd.isna(value):
         return None
@@ -367,35 +514,41 @@ def atr_expansion(
     baseline_period: int = 20,
 ) -> float | None:
     """
-    Compare current ATR with its recent baseline.
+    Compare current Wilder ATR with its recent baseline.
 
     Example:
         2.0 means current ATR is approximately twice
         its recent average level.
+
+    The baseline excludes the current ATR observation.
     """
 
-    if atr_period <= 0 or baseline_period <= 0:
+    if (
+        atr_period <= 0
+        or baseline_period <= 0
+    ):
         raise ValueError(
-            "ATR and baseline periods must be greater than zero."
+            "ATR and baseline periods must be "
+            "greater than zero."
         )
 
-    minimum_rows = atr_period + baseline_period
+    minimum_rows = (
+        atr_period
+        + baseline_period
+    )
 
     if len(df) < minimum_rows:
         return None
 
-    true_range = true_range_series(df)
+    series = atr_series(
+        df,
+        period=atr_period,
+    )
 
-    atr_series = true_range.ewm(
-        alpha=1 / atr_period,
-        adjust=False,
-        min_periods=atr_period,
-    ).mean()
-
-    current_atr = atr_series.iloc[-1]
+    current_atr = series.iloc[-1]
 
     baseline = (
-        atr_series
+        series
         .iloc[:-1]
         .dropna()
         .tail(baseline_period)
@@ -409,7 +562,9 @@ def atr_expansion(
     ):
         return None
 
-    return float(current_atr / baseline)
+    return float(
+        current_atr / baseline
+    )
 
 
 # ============================================================
@@ -418,30 +573,83 @@ def atr_expansion(
 
 def remove_incomplete_session(
     df: pd.DataFrame,
+    *,
+    now: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """
-    Remove today's still-forming daily candle when Massive
-    includes it in the aggregate response.
+    Remove today's still-forming U.S. daily candle.
 
-    V1 deliberately analyzes completed daily sessions only.
-    Intraday scanning will be implemented separately.
+    Daily aggregate timestamps are converted to
+    America/New_York before determining the session date.
+
+    If the newest bar belongs to today's New York trading
+    date and regular trading has not yet reached 4:00 PM ET,
+    that bar is removed.
+
+    At or after 4:00 PM ET, today's regular session is
+    considered complete and the bar is retained.
+
+    `now` is injectable so this behavior can be tested
+    deterministically.
+
+    This function intentionally handles regular-session
+    completion only. Intraday scanning is separate.
     """
 
     if df.empty:
         return df
 
-    today_utc = pd.Timestamp.now(
-        tz="UTC"
-    ).normalize()
+    if now is None:
+        current = pd.Timestamp.now(
+            tz=MARKET_TIMEZONE,
+        )
+    else:
+        current = pd.Timestamp(now)
 
-    latest_session = (
+        if current.tzinfo is None:
+            raise ValueError(
+                "now must be timezone-aware."
+            )
+
+        current = current.tz_convert(
+            MARKET_TIMEZONE
+        )
+
+    latest_timestamp = pd.Timestamp(
         df.iloc[-1]["timestamp"]
-        .normalize()
+    )
+
+    if latest_timestamp.tzinfo is None:
+        latest_timestamp = (
+            latest_timestamp.tz_localize("UTC")
+        )
+
+    latest_market_time = (
+        latest_timestamp.tz_convert(
+            MARKET_TIMEZONE
+        )
+    )
+
+    latest_session_date = (
+        latest_market_time.date()
+    )
+
+    current_market_date = (
+        current.date()
+    )
+
+    market_close = pd.Timestamp.combine(
+        current_market_date,
+        REGULAR_MARKET_CLOSE,
+    ).tz_localize(
+        MARKET_TIMEZONE
     )
 
     if (
         len(df) >= 2
-        and latest_session == today_utc
+        and latest_session_date
+        == current_market_date
+        and current < market_close
     ):
         return (
             df
@@ -521,7 +729,9 @@ def build_snapshot(
 
     snapshot = {
         # DATA TIMESTAMP
-        "as_of": latest["timestamp"].isoformat(),
+        "as_of": (
+            latest["timestamp"].isoformat()
+        ),
 
         # PRICE
         "price": close,
@@ -563,7 +773,9 @@ def build_snapshot(
         "avg_volume_20d": avg_volume_20d,
         "relative_volume": relative_volume(
             current_volume=volume,
-            average_volume_value=avg_volume_20d,
+            average_volume_value=(
+                avg_volume_20d
+            ),
         ),
 
         # MOMENTUM
@@ -579,21 +791,29 @@ def build_snapshot(
         "sma_200": sma_200,
 
         # PRICE EXTENSION
-        "distance_sma_10_pct": distance_from_level_pct(
-            price=close,
-            level=sma_10,
+        "distance_sma_10_pct": (
+            distance_from_level_pct(
+                price=close,
+                level=sma_10,
+            )
         ),
-        "distance_sma_20_pct": distance_from_level_pct(
-            price=close,
-            level=sma_20,
+        "distance_sma_20_pct": (
+            distance_from_level_pct(
+                price=close,
+                level=sma_20,
+            )
         ),
-        "distance_sma_50_pct": distance_from_level_pct(
-            price=close,
-            level=sma_50,
+        "distance_sma_50_pct": (
+            distance_from_level_pct(
+                price=close,
+                level=sma_50,
+            )
         ),
-        "distance_sma_200_pct": distance_from_level_pct(
-            price=close,
-            level=sma_200,
+        "distance_sma_200_pct": (
+            distance_from_level_pct(
+                price=close,
+                level=sma_200,
+            )
         ),
 
         # VOLATILITY
