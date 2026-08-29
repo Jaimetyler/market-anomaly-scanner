@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import time
 from typing import Any, Iterable
 
 import pandas as pd
@@ -17,6 +19,7 @@ from scanner.events import (
     cluster_signal_events,
     make_signal_observation,
 )
+from scanner.feature_frame import snapshots_by_session
 from scanner.historical import (
     build_snapshot_as_of,
     calculate_historical_outcomes,
@@ -39,6 +42,12 @@ HARD_MAX_TICKERS = 250
 
 MARKET_CALENDAR_TICKER = "SPY"
 EVENT_MAX_GAP_SESSIONS = 3
+
+# Historical ticker mining is I/O-heavy because each ticker
+# needs market bars and corporate-action data. Keep concurrency
+# deliberately bounded so optimization cannot turn into an
+# uncontrolled API fan-out.
+TICKER_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -1123,10 +1132,39 @@ def membership_dates_for_ticker(
     Return exactly the supplied market sessions on
     which ticker belonged to the point-in-time
     historical universe.
+
+    Production RollingUniverseResult objects contain a
+    precomputed inverse membership index, so this lookup
+    no longer rescans ~5,000 securities for every ticker
+    on every market session.
+
+    A snapshot-scan fallback is retained for older or
+    manually constructed RollingUniverseResult objects.
     """
 
     target = ticker.upper().strip()
 
+    membership_index = (
+        rolling_universe
+        .membership_dates_by_ticker
+    )
+
+    if membership_index:
+        indexed_dates = membership_index.get(
+            target,
+            frozenset(),
+        )
+
+        return {
+            session_date
+            for session_date in session_dates
+            if session_date in indexed_dates
+        }
+
+    # Backward-compatible fallback used only when no inverse
+    # index is present. Production rolling universes build the
+    # index once while the daily snapshots are already being
+    # traversed.
     eligible_dates: set[str] = set()
 
     for session_date in session_dates:
@@ -1156,6 +1194,18 @@ def mine_ticker(
     list[dict[str, Any]],
     int,
 ]:
+    """
+    Mine one ticker using one precomputed feature frame.
+
+    Critical performance rule:
+        We do NOT rebuild build_snapshot_as_of() for every session.
+        All rolling features are calculated once for the ticker, then
+        snapshots are looked up by session date.
+
+    Corporate-action history is also loaded lazily: only after the
+    ticker has produced at least one anomaly candidate.
+    """
+
     fetch_start = (
         start_date
         - timedelta(
@@ -1195,6 +1245,65 @@ def mine_ticker(
             if signal_date in eligible_session_dates
         ]
 
+    if not signal_dates:
+        return (
+            [],
+            0,
+        )
+
+    # ------------------------------------------------------
+    # PRECOMPUTE ALL DETERMINISTIC FEATURES ONCE
+    # ------------------------------------------------------
+    snapshot_index = snapshots_by_session(
+        bars
+    )
+
+    candidates: list[
+        tuple[
+            str,
+            dict[str, Any],
+            Any,
+            Any,
+        ]
+    ] = []
+
+    for signal_date in signal_dates:
+        snapshot = snapshot_index.get(
+            signal_date
+        )
+
+        if snapshot is None:
+            continue
+
+        detection = detect_anomaly(
+            snapshot
+        )
+
+        if not detection.candidate:
+            continue
+
+        classification = classify_setup(
+            snapshot
+        )
+
+        candidates.append(
+            (
+                signal_date,
+                snapshot,
+                detection,
+                classification,
+            )
+        )
+
+    # Most tickers produce no anomaly candidates. Do not touch the
+    # corporate-action endpoint/cache unless there is actually a
+    # research observation to annotate.
+    if not candidates:
+        return (
+            [],
+            len(signal_dates),
+        )
+
     corporate_actions = get_stock_splits(
         ticker=ticker
     )
@@ -1203,16 +1312,48 @@ def mine_ticker(
         dict[str, Any]
     ] = []
 
-    for signal_date in signal_dates:
-        result = analyze_historical_signal(
-            ticker=ticker,
-            bars=bars,
-            signal_date=signal_date,
-            corporate_actions=corporate_actions,
+    for (
+        signal_date,
+        snapshot,
+        detection,
+        classification,
+    ) in candidates:
+        corporate_action_check = (
+            check_corporate_action_risk(
+                signal_date=signal_date,
+                actions=corporate_actions,
+                return_1d=snapshot.get(
+                    "return_1d"
+                ),
+                return_5d=snapshot.get(
+                    "return_5d"
+                ),
+                return_20d=snapshot.get(
+                    "return_20d"
+                ),
+            )
         )
 
-        if result is None:
-            continue
+        # INFORMATION WALL:
+        # Detection and classification above have no access to future
+        # sessions. Outcomes are calculated only after the signal has
+        # already been accepted as a candidate.
+        outcomes = calculate_historical_outcomes(
+            bars=bars,
+            signal_date=signal_date,
+        )
+
+        result = {
+            "ticker": ticker,
+            "signal_date": signal_date,
+            "snapshot": snapshot,
+            "detection": detection,
+            "classification": classification,
+            "corporate_action_check": (
+                corporate_action_check
+            ),
+            "outcomes": outcomes,
+        }
 
         rows.append(
             build_research_row(
@@ -1225,6 +1366,41 @@ def mine_ticker(
         len(signal_dates),
     )
 
+
+def _mine_selected_ticker(
+    *,
+    ticker: str,
+    start_date: date,
+    end_date: date,
+    eligible_session_dates: set[str],
+) -> tuple[
+    list[dict[str, Any]],
+    int,
+    float,
+]:
+    """Run one ticker and return elapsed wall-clock seconds."""
+
+    started = time.perf_counter()
+
+    rows, sessions = mine_ticker(
+        ticker=ticker,
+        start_date=start_date,
+        end_date=end_date,
+        eligible_session_dates=(
+            eligible_session_dates
+        ),
+    )
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
+    return (
+        rows,
+        sessions,
+        elapsed,
+    )
 
 def mine_history(
     config: HistoricalMinerConfig,
@@ -1298,32 +1474,54 @@ def mine_history(
         selected
     )
 
-    for index, security in enumerate(
-        selected,
-        start=1,
-    ):
-        ticker = security.ticker
+    worker_count = min(
+        TICKER_WORKERS,
+        total,
+    )
 
-        print(
-            f"[{index:>3}/{total:<3}] "
-            f"{ticker:<8}",
-            end="",
-            flush=True,
-        )
+    print(
+        f"Ticker workers: {worker_count} "
+        f"(bounded)"
+    )
+    print()
 
-        try:
+    # Keep at most worker_count ticker jobs in flight at any moment.
+    # When one finishes, immediately submit the next ticker. A slow
+    # ticker therefore cannot stall an entire fixed batch.
+    completed_results: dict[
+        int,
+        tuple[str, list[dict[str, Any]], int, float]
+    ] = {}
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count
+    ) as executor:
+        next_to_submit = 0
+        in_flight: dict[Any, tuple[int, str]] = {}
+
+        def submit_one(
+            selection_index: int,
+        ) -> None:
+            security = selected[
+                selection_index
+            ]
+
+            ticker = security.ticker
+
             eligible_session_dates = (
                 membership_dates_for_ticker(
                     ticker=ticker,
-                    session_dates=market_session_dates,
-                    rolling_universe=rolling_universe,
+                    session_dates=(
+                        market_session_dates
+                    ),
+                    rolling_universe=(
+                        rolling_universe
+                    ),
                 )
             )
 
-            (
-                ticker_rows,
-                ticker_sessions,
-            ) = mine_ticker(
+            future = executor.submit(
+                _mine_selected_ticker,
                 ticker=ticker,
                 start_date=config.start_date,
                 end_date=config.end_date,
@@ -1332,37 +1530,137 @@ def mine_history(
                 ),
             )
 
-            rows.extend(
-                ticker_rows
+            in_flight[future] = (
+                selection_index,
+                ticker,
             )
 
-            sessions_tested += (
-                ticker_sessions
+        while (
+            next_to_submit < total
+            and len(in_flight) < worker_count
+        ):
+            submit_one(
+                next_to_submit
+            )
+            next_to_submit += 1
+
+        done_count = 0
+
+        while in_flight:
+            done, _ = wait(
+                in_flight,
+                return_when=FIRST_COMPLETED,
             )
 
-            tickers_completed += 1
+            for future in done:
+                selection_index, ticker = (
+                    in_flight.pop(
+                        future
+                    )
+                )
 
-            print(
-                f" sessions={ticker_sessions:>3} "
-                f"anomalies={len(ticker_rows):>3}"
-            )
+                done_count += 1
 
-        except Exception as exc:
-            errors.append(
-                {
-                    "ticker": ticker,
-                    "error": (
+                try:
+                    (
+                        ticker_rows,
+                        ticker_sessions,
+                        elapsed,
+                    ) = future.result()
+
+                    completed_results[
+                        selection_index
+                    ] = (
+                        ticker,
+                        ticker_rows,
+                        ticker_sessions,
+                        elapsed,
+                    )
+
+                    slow = (
+                        " SLOW"
+                        if elapsed >= 5.0
+                        else ""
+                    )
+
+                    print(
+                        f"[{done_count:>3}/{total:<3} done] "
+                        f"#{selection_index + 1:<3} "
+                        f"{ticker:<8} "
+                        f"{elapsed:>6.2f}s "
+                        f"sessions={ticker_sessions:>3} "
+                        f"anomalies={len(ticker_rows):>3}"
+                        f"{slow}"
+                    )
+
+                except Exception as exc:
+                    completed_results[
+                        selection_index
+                    ] = (
+                        ticker,
+                        [],
+                        0,
+                        0.0,
+                    )
+
+                    errors.append(
+                        {
+                            "ticker": ticker,
+                            "error": (
+                                f"{type(exc).__name__}: "
+                                f"{exc}"
+                            ),
+                        }
+                    )
+
+                    print(
+                        f"[{done_count:>3}/{total:<3} done] "
+                        f"#{selection_index + 1:<3} "
+                        f"{ticker:<8} FAILED "
                         f"{type(exc).__name__}: "
                         f"{exc}"
-                    ),
-                }
-            )
+                    )
 
-            print(
-                " FAILED "
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            )
+                if next_to_submit < total:
+                    submit_one(
+                        next_to_submit
+                    )
+                    next_to_submit += 1
+
+    # Merge successful results in deterministic original selection order.
+    # Completion order affects only progress display, never research rows.
+    for selection_index in range(
+        total
+    ):
+        result = completed_results.get(
+            selection_index
+        )
+
+        if result is None:
+            continue
+
+        (
+            ticker,
+            ticker_rows,
+            ticker_sessions,
+            _elapsed,
+        ) = result
+
+        if any(
+            error["ticker"] == ticker
+            for error in errors
+        ):
+            continue
+
+        rows.extend(
+            ticker_rows
+        )
+
+        sessions_tested += (
+            ticker_sessions
+        )
+
+        tickers_completed += 1
 
     research_eligible = sum(
         1

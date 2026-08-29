@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 import json
 from pathlib import Path
@@ -73,6 +73,11 @@ class RollingUniverseResult:
 
     cached_snapshots:
         Number of snapshots loaded from local cache.
+
+    membership_dates_by_ticker:
+        Precomputed inverse membership index. Maps ticker to
+        the exact requested session dates on which it belonged
+        to the point-in-time universe.
     """
 
     snapshots: dict[str, list[HistoricalTicker]]
@@ -81,6 +86,9 @@ class RollingUniverseResult:
     securities: dict[str, HistoricalTicker]
     fetched_snapshots: int
     cached_snapshots: int
+    membership_dates_by_ticker: dict[str, frozenset[str]] = field(
+        default_factory=dict
+    )
 
 
 def _normalize_date(
@@ -476,6 +484,11 @@ def get_rolling_historical_universe(
         HistoricalTicker,
     ] = {}
 
+    membership_dates_mutable: dict[
+        str,
+        set[str],
+    ] = {}
+
     fetched_snapshots = 0
     cached_snapshots = 0
 
@@ -510,6 +523,13 @@ def get_rolling_historical_universe(
         for security in result.tickers:
             ticker = security.ticker
 
+            membership_dates_mutable.setdefault(
+                ticker,
+                set(),
+            ).add(
+                session_key
+            )
+
             securities[
                 ticker
             ] = security
@@ -531,6 +551,12 @@ def get_rolling_historical_universe(
             f"{source}"
         )
 
+    membership_dates_by_ticker = {
+        ticker: frozenset(dates)
+        for ticker, dates
+        in membership_dates_mutable.items()
+    }
+
     return RollingUniverseResult(
         snapshots=snapshots,
         first_seen=first_seen,
@@ -541,6 +567,9 @@ def get_rolling_historical_universe(
         ),
         cached_snapshots=(
             cached_snapshots
+        ),
+        membership_dates_by_ticker=(
+            membership_dates_by_ticker
         ),
     )
 
