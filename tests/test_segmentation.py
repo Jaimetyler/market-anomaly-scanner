@@ -137,7 +137,33 @@ def test_multi_column_segmentation() -> None:
     assert len(result) == 1
     assert result.iloc[0]["price_bucket"] == "$5-$10"
     assert result.iloc[0]["rvol_bucket"] == "3-5x"
-    assert result.iloc[0]["n"] == 2
+
+
+def test_multi_column_segmentation_excludes_incomplete_keys() -> None:
+    rows = []
+    for rvol_bucket in ("3-5x", None):
+        rows.append(
+            {
+                "initial_setup": "FRESH_SPIKE",
+                "rvol_bucket": rvol_bucket,
+                "outcome_available_5d": True,
+                "contrarian_return_5d": 0.05,
+                "reversed_5d": True,
+                "contrarian_mfe_5d": 0.08,
+                "contrarian_mae_5d": -0.01,
+            }
+        )
+
+    result = summarize_segments(
+        pd.DataFrame(rows),
+        group_by=["initial_setup", "rvol_bucket"],
+        horizons=(5,),
+        min_n=1,
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["rvol_bucket"] == "3-5x"
+    assert result.iloc[0]["n"] == 1
 
 
 def test_rank_best_segments() -> None:

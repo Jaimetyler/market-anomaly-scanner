@@ -304,9 +304,12 @@ def evaluate_segment_significance(
 
     rows: list[dict] = []
 
-    grouped = outcomes.groupby(
+    # Statistical tests require a fully specified segment definition.
+    # Missing bucket values represent unavailable source data, not a segment.
+    complete_outcomes = outcomes.dropna(subset=group_by)
+
+    grouped = complete_outcomes.groupby(
         group_by[0] if len(group_by) == 1 else group_by,
-        dropna=False,
         observed=True,
         sort=True,
     )

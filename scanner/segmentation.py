@@ -261,9 +261,13 @@ def summarize_segments(
 
     rows: list[dict] = []
 
-    grouped = outcomes.groupby(
+    # A segment definition is only valid when every dimension is known.
+    # Missing source features deliberately produce missing buckets; those
+    # rows must not become a synthetic "missing" research segment.
+    complete_outcomes = outcomes.dropna(subset=group_by)
+
+    grouped = complete_outcomes.groupby(
         group_by[0] if len(group_by) == 1 else group_by,
-        dropna=False,
         observed=True,
         sort=True,
     )

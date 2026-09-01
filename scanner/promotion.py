@@ -48,6 +48,16 @@ def _segment_key(
     )
 
 
+def _has_complete_segment_key(
+    row: pd.Series,
+    group_columns: Sequence[str],
+) -> bool:
+    return all(
+        column in row.index and pd.notna(row[column])
+        for column in group_columns
+    )
+
+
 def classify_evidence(
     row: pd.Series,
     *,
@@ -183,6 +193,9 @@ def combine_evidence(
         if group_columns is None:
             continue
 
+        if not _has_complete_segment_key(row, group_columns):
+            continue
+
         key = _segment_key(
             row,
             segmentation=segmentation,
@@ -195,6 +208,9 @@ def combine_evidence(
         group_columns = grouping_map.get(segmentation)
 
         if group_columns is None:
+            continue
+
+        if not _has_complete_segment_key(sig_row, group_columns):
             continue
 
         key = _segment_key(

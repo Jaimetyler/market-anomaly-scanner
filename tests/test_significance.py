@@ -114,3 +114,27 @@ def test_evaluate_segment_significance_supports_real_edge() -> None:
     assert a["win_rate"] == pytest.approx(0.80)
     assert bool(a["statistically_supported"]) is True
     assert bool(b["statistically_supported"]) is False
+
+
+def test_significance_excludes_incomplete_segment_keys() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "initial_setup": "FRESH_SPIKE",
+                "rvol_bucket": None,
+                "outcome_available_5d": True,
+                "contrarian_return_5d": 0.08,
+            }
+            for _ in range(30)
+        ]
+    )
+
+    result = evaluate_segment_significance(
+        frame,
+        group_by=["initial_setup", "rvol_bucket"],
+        horizons=(5,),
+        min_n=30,
+        config=SignificanceConfig(bootstrap_samples=100),
+    )
+
+    assert result.empty

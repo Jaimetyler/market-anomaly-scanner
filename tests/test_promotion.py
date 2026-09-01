@@ -174,3 +174,45 @@ def test_combine_evidence_leaves_unmatched_as_non_promoted() -> None:
 
     assert len(result) == 1
     assert result.iloc[0]["disposition"] == "WATCH"
+
+
+def test_combine_evidence_excludes_incomplete_segment_keys() -> None:
+    significance = pd.DataFrame(
+        [
+            {
+                "segmentation": "setup_x_rvol",
+                "horizon_days": 5,
+                "initial_setup": "FRESH_SPIKE",
+                "rvol_bucket": None,
+                "globally_supported": True,
+                "confidence_score": 1.2,
+                "global_q_value": 0.01,
+                "n": 200,
+                "win_rate": 0.63,
+                "median_contrarian_return": 0.07,
+            }
+        ]
+    )
+    persistence = pd.DataFrame(
+        [
+            {
+                "segmentation": "setup_x_rvol",
+                "horizon_days": 5,
+                "initial_setup": "FRESH_SPIKE",
+                "rvol_bucket": None,
+                "folds_tested": 4,
+                "validation_rate": 0.75,
+                "total_test_n": 80,
+                "weighted_test_win_rate": 0.60,
+                "median_test_median_return": 0.04,
+            }
+        ]
+    )
+
+    result = combine_evidence(
+        significance=significance,
+        persistence=persistence,
+        grouping_map=GROUPING_MAP,
+    )
+
+    assert result.empty

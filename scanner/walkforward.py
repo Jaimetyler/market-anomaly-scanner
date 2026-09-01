@@ -157,6 +157,13 @@ def walk_forward_validate(
     if missing_groups:
         raise ValueError(f"Missing grouping columns: {missing_groups}")
 
+    # A frozen segment must have a concrete value for every dimension.
+    # Do not turn unavailable feature data into a null-valued segment.
+    frame = frame.dropna(subset=group_by).copy()
+
+    if frame.empty:
+        return pd.DataFrame()
+
     years = sorted(frame["walkforward_year"].unique().tolist())
     if len(years) < 2:
         raise ValueError(
@@ -348,9 +355,10 @@ def summarize_walk_forward(
     keys = [*group_by, "horizon_days"]
     rows: list[dict] = []
 
-    grouped = results.groupby(
+    complete_results = results.dropna(subset=group_by)
+
+    grouped = complete_results.groupby(
         keys[0] if len(keys) == 1 else keys,
-        dropna=False,
         observed=True,
         sort=True,
     )
