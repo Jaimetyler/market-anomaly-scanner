@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 import json
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -236,15 +237,70 @@ def _fetch_active_tickers(
 
         seen_urls.add(url)
 
-        response = httpx.get(
-            url,
-            params=params,
-            timeout=60.0,
-        )
+        max_attempts = 8
+        retry_delays = (2, 4, 8, 16, 30, 30, 30)
 
-        response.raise_for_status()
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = httpx.get(
+                    url,
+                    params=params,
+                    timeout=60.0,
+                )
 
-        payload = response.json()
+                # Retry temporary server/rate-limit failures.
+                if (
+                    response.status_code == 429
+                    or 500 <= response.status_code <= 599
+                ):
+                    if attempt == max_attempts:
+                        response.raise_for_status()
+
+                    delay = retry_delays[attempt - 1]
+                    retry_after = response.headers.get(
+                        "Retry-After"
+                    )
+
+                    if retry_after:
+                        try:
+                            delay = max(
+                                delay,
+                                int(retry_after),
+                            )
+                        except ValueError:
+                            pass
+
+                    print(
+                        "  Massive universe request "
+                        f"for {as_of_date.isoformat()} "
+                        f"returned HTTP {response.status_code} "
+                        f"(attempt {attempt}/{max_attempts}). "
+                        f"Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                response.raise_for_status()
+                payload = response.json()
+                break
+
+            except httpx.RequestError as exc:
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        "Massive historical universe request "
+                        f"failed for {as_of_date.isoformat()} "
+                        f"after {max_attempts} attempts."
+                    ) from exc
+
+                delay = retry_delays[attempt - 1]
+
+                print(
+                    "  Massive universe request "
+                    f"for {as_of_date.isoformat()} failed "
+                    f"(attempt {attempt}/{max_attempts}): "
+                    f"{exc}. Retrying in {delay}s..."
+                )
+                time.sleep(delay)
 
         page_results = (
             payload.get(
