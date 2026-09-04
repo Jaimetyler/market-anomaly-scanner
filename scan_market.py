@@ -10,6 +10,11 @@ from scanner.grouped import (
     grouped_sessions_to_dataframe,
 )
 from scanner.indicators import build_snapshot
+from scanner.live_research import (
+    best_match_per_archetype,
+    load_promoted_archetype_members,
+    match_live_snapshot,
+)
 from scanner.universe import get_active_stock_universe
 
 
@@ -28,74 +33,72 @@ def format_x(value):
     return f"{value:.1f}x"
 
 
-def deep_rank_value(result):
-    """
-    Temporary ranking function.
+def format_rate(value):
+    if value is None:
+        return "N/A"
 
-    This is NOT our final anomaly score.
-    It only sorts the current research output.
+    return f"{value:.1%}"
+
+
+def research_rank_value(result):
     """
+    Rank live anomalies primarily by validated research evidence.
+
+    This is still a research ranking, not a trading recommendation
+    or final production score.
+
+    Priority:
+    1. Has a validated archetype match.
+    2. Promotion score.
+    3. Out-of-sample sample size.
+    4. Out-of-sample win rate.
+    5. Out-of-sample median contrarian return.
+    6. Current anomaly intensity as a final tie-breaker.
+    """
+
+    best_match = result.get("best_research_match")
 
     snapshot = result["snapshot"]
     detection = result["detection"]
 
+    if best_match is None:
+        research_flag = 0
+        promotion_score = 0.0
+        oos_n = 0
+        oos_win_rate = 0.0
+        oos_median_return = 0.0
+    else:
+        research_flag = 1
+        promotion_score = best_match.promotion_score
+        oos_n = best_match.oos_n
+        oos_win_rate = best_match.oos_win_rate
+        oos_median_return = best_match.oos_median_return
+
     trigger_count = len(detection.triggers)
     evidence_count = len(detection.evidence)
 
-    return_1d = snapshot.get("return_1d") or 0
-    return_5d = snapshot.get("return_5d") or 0
-    return_20d = snapshot.get("return_20d") or 0
+    return_1d = snapshot.get("return_1d") or 0.0
+    return_5d = snapshot.get("return_5d") or 0.0
 
-    distance_sma20 = (
-        snapshot.get("distance_sma_20_pct")
-        or 0
+    return (
+        research_flag,
+        promotion_score,
+        oos_n,
+        oos_win_rate,
+        oos_median_return,
+        trigger_count,
+        evidence_count,
+        return_5d,
+        return_1d,
     )
-
-    relative_volume = (
-        snapshot.get("relative_volume")
-        or 0
-    )
-
-    atr_expansion = (
-        snapshot.get("atr_expansion")
-        or 0
-    )
-
-    score = 0.0
-
-    score += trigger_count * 1000
-    score += evidence_count * 100
-
-    score += max(return_1d, 0)
-    score += max(return_5d, 0) * 0.75
-    score += max(return_20d, 0) * 0.25
-
-    score += max(distance_sma20, 0)
-
-    score += (
-        min(
-            max(relative_volume, 0),
-            25,
-        )
-        * 5
-    )
-
-    score += (
-        min(
-            max(atr_expansion, 0),
-            10,
-        )
-        * 10
-    )
-
-    return score
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Scan the U.S. common-stock market "
-            "for upside anomalies."
+            "for upside anomalies and validated "
+            "historical contrarian setups."
         )
     )
 
@@ -131,15 +134,43 @@ def main():
     args = parser.parse_args()
 
     print()
-    print("=" * 150)
+    print("=" * 170)
     print("MARKET ANOMALY SCANNER")
-    print("=" * 150)
+    print("=" * 170)
     print()
 
     # --------------------------------------------------
-    # 1. Eligible universe
+    # 1. Load promoted research evidence
     # --------------------------------------------------
 
+    print(
+        "Loading validated research archetypes..."
+    )
+
+    research_members = (
+        load_promoted_archetype_members()
+    )
+
+    research_archetype_count = (
+        research_members["archetype_id"]
+        .nunique()
+    )
+
+    print(
+        f"Promoted research definitions: "
+        f"{len(research_members):,}"
+    )
+
+    print(
+        f"Validated archetypes:           "
+        f"{research_archetype_count:,}"
+    )
+
+    # --------------------------------------------------
+    # 2. Eligible universe
+    # --------------------------------------------------
+
+    print()
     print(
         "Loading eligible common-stock universe..."
     )
@@ -156,7 +187,7 @@ def main():
     )
 
     # --------------------------------------------------
-    # 2. Recent grouped market history
+    # 3. Recent grouped market history
     # --------------------------------------------------
 
     print()
@@ -195,7 +226,7 @@ def main():
     )
 
     # --------------------------------------------------
-    # 3. Restrict grouped data to common stocks
+    # 4. Restrict grouped data to common stocks
     # --------------------------------------------------
 
     print()
@@ -232,7 +263,7 @@ def main():
     )
 
     # --------------------------------------------------
-    # 4. Multi-day market-wide prefilter
+    # 5. Multi-day market-wide prefilter
     # --------------------------------------------------
 
     print()
@@ -270,7 +301,7 @@ def main():
     )
 
     # --------------------------------------------------
-    # 5. Deep historical analysis
+    # 6. Deep analysis + research matching
     # --------------------------------------------------
 
     end_date = date.today()
@@ -284,7 +315,8 @@ def main():
 
     print()
     print(
-        "Running deep historical analysis..."
+        "Running deep historical analysis "
+        "and archetype matching..."
     )
     print()
 
@@ -337,9 +369,39 @@ def main():
                 snapshot
             )
 
+            raw_matches = match_live_snapshot(
+                snapshot=snapshot,
+                initial_setup=(
+                    classification.primary_setup
+                ),
+                members_df=research_members,
+            )
+
+            archetype_matches = (
+                best_match_per_archetype(
+                    raw_matches
+                )
+            )
+
+            best_research_match = (
+                archetype_matches[0]
+                if archetype_matches
+                else None
+            )
+
+            if best_research_match is None:
+                research_text = "NO RESEARCH MATCH"
+            else:
+                research_text = (
+                    f"{best_research_match.archetype_id} "
+                    f"{best_research_match.horizon_days}D "
+                    f"{best_research_match.oos_win_rate:.1%}"
+                )
+
             print(
                 f" CANDIDATE  "
-                f"{classification.primary_setup}"
+                f"{classification.primary_setup:<24} "
+                f"{research_text}"
             )
 
             results.append(
@@ -349,6 +411,11 @@ def main():
                     "snapshot": snapshot,
                     "detection": detection,
                     "classification": classification,
+                    "raw_research_matches": raw_matches,
+                    "research_matches": archetype_matches,
+                    "best_research_match": (
+                        best_research_match
+                    ),
                 }
             )
 
@@ -358,97 +425,228 @@ def main():
             )
 
     # --------------------------------------------------
-    # 6. Temporary ranking
+    # 7. Research-aware ranking
     # --------------------------------------------------
 
     results.sort(
-        key=deep_rank_value,
+        key=research_rank_value,
         reverse=True,
     )
 
     # --------------------------------------------------
-    # 7. Display ranked anomalies
+    # 8. Display ranked anomalies
     # --------------------------------------------------
 
     print()
-    print("=" * 150)
-    print("FINAL MARKET ANOMALIES")
-    print("=" * 150)
+    print("=" * 170)
+    print("VALIDATED LIVE ANOMALIES")
+    print("=" * 170)
 
     if not results:
         print(
             "No deep anomalies detected."
         )
-        print("=" * 150)
+        print("=" * 170)
         return
 
     header = (
         f"{'TICKER':<8}"
+        f"{'SETUP':<25}"
+        f"{'ARCH':<7}"
+        f"{'HZN':>5}"
+        f"{'OOS N':>9}"
+        f"{'OOS WR':>9}"
+        f"{'OOS MED':>10}"
+        f"{'WORST':>10}"
         f"{'1D':>9}"
         f"{'5D':>9}"
-        f"{'20D':>9}"
         f"{'RVOL':>9}"
-        f"{'RSI':>8}"
         f"{'SMA20':>9}"
-        f"{'ATRx':>8}"
-        f"{'TRIG':>7}"
-        f"{'EVID':>7}"
-        f"  {'PRIMARY SETUP':<25}"
+        f"{'MATCHES':>9}"
     )
 
     print(header)
-    print("-" * 150)
+    print("-" * 170)
 
     for result in results[
         :args.show
     ]:
         ticker = result["ticker"]
+
         snapshot = result["snapshot"]
-        detection = result["detection"]
+
         classification = result[
             "classification"
         ]
 
-        relative_volume = snapshot.get(
-            "relative_volume"
+        best_match = result.get(
+            "best_research_match"
         )
 
-        rsi = snapshot.get(
-            "rsi_14"
+        research_matches = result.get(
+            "research_matches",
+            [],
         )
 
-        sma20 = snapshot.get(
-            "distance_sma_20_pct"
-        )
+        if best_match is None:
+            archetype = "-"
+            horizon = "-"
+            oos_n = "-"
+            oos_wr = "-"
+            oos_med = "-"
+            worst = "-"
+        else:
+            archetype = (
+                best_match.archetype_id
+            )
 
-        atr_expansion = snapshot.get(
-            "atr_expansion"
-        )
+            horizon = (
+                f"{best_match.horizon_days}D"
+            )
 
-        rsi_text = (
-            f"{rsi:.1f}"
-            if rsi is not None
-            else "N/A"
-        )
+            oos_n = (
+                f"{best_match.oos_n:,}"
+            )
+
+            oos_wr = (
+                f"{best_match.oos_win_rate:.1%}"
+            )
+
+            oos_med = (
+                f"{best_match.oos_median_return:+.2f}%"
+            )
+
+            worst = (
+                f"{best_match.worst_oos_median_return:+.2f}%"
+            )
 
         print(
             f"{ticker:<8}"
+            f"{classification.primary_setup:<25}"
+            f"{archetype:<7}"
+            f"{horizon:>5}"
+            f"{oos_n:>9}"
+            f"{oos_wr:>9}"
+            f"{oos_med:>10}"
+            f"{worst:>10}"
             f"{format_pct(snapshot.get('return_1d')):>9}"
             f"{format_pct(snapshot.get('return_5d')):>9}"
-            f"{format_pct(snapshot.get('return_20d')):>9}"
-            f"{format_x(relative_volume):>9}"
-            f"{rsi_text:>8}"
-            f"{format_pct(sma20):>9}"
-            f"{format_x(atr_expansion):>8}"
-            f"{len(detection.triggers):>7}"
-            f"{len(detection.evidence):>7}"
-            f"  {classification.primary_setup:<25}"
+            f"{format_x(snapshot.get('relative_volume')):>9}"
+            f"{format_pct(snapshot.get('distance_sma_20_pct')):>9}"
+            f"{len(research_matches):>9}"
         )
 
-    print("=" * 150)
+    print("=" * 170)
 
     # --------------------------------------------------
-    # 8. Setup distribution
+    # 9. Detailed research evidence
+    # --------------------------------------------------
+
+    print()
+    print("TOP RESEARCH EVIDENCE")
+    print("=" * 120)
+
+    displayed = 0
+
+    for result in results[
+        :args.show
+    ]:
+        best_match = result.get(
+            "best_research_match"
+        )
+
+        if best_match is None:
+            continue
+
+        displayed += 1
+
+        ticker = result["ticker"]
+
+        classification = result[
+            "classification"
+        ]
+
+        print()
+        print(
+            f"{ticker} — "
+            f"{classification.primary_setup}"
+        )
+
+        print(
+            f"  Archetype:           "
+            f"{best_match.archetype_id}"
+        )
+
+        print(
+            f"  Condition:           "
+            f"{best_match.condition}"
+        )
+
+        print(
+            f"  Horizon:             "
+            f"{best_match.horizon_days} trading days"
+        )
+
+        print(
+            f"  Historical N:        "
+            f"{best_match.historical_n:,}"
+        )
+
+        print(
+            f"  Historical win rate: "
+            f"{best_match.historical_win_rate:.1%}"
+        )
+
+        print(
+            f"  Historical median:   "
+            f"{best_match.historical_median_return:+.2f}%"
+        )
+
+        print(
+            f"  OOS N:               "
+            f"{best_match.oos_n:,}"
+        )
+
+        print(
+            f"  OOS win rate:        "
+            f"{best_match.oos_win_rate:.1%}"
+        )
+
+        print(
+            f"  OOS median return:   "
+            f"{best_match.oos_median_return:+.2f}%"
+        )
+
+        print(
+            f"  Worst OOS median:    "
+            f"{best_match.worst_oos_median_return:+.2f}%"
+        )
+
+        print(
+            f"  Walk-forward folds:  "
+            f"{best_match.validated_folds}/"
+            f"{best_match.folds_tested}"
+        )
+
+        print(
+            f"  Validation rate:     "
+            f"{best_match.validation_rate:.1%}"
+        )
+
+        print(
+            f"  Promotion score:     "
+            f"{best_match.promotion_score:.2f}"
+        )
+
+    if displayed == 0:
+        print()
+        print(
+            "No displayed anomalies matched a "
+            "promoted research archetype."
+        )
+
+    # --------------------------------------------------
+    # 10. Setup distribution
     # --------------------------------------------------
 
     setup_counts = {}
@@ -470,7 +668,7 @@ def main():
 
     print()
     print("SETUP DISTRIBUTION")
-    print("-" * 50)
+    print("-" * 60)
 
     for setup, count in sorted(
         setup_counts.items(),
@@ -478,76 +676,76 @@ def main():
         reverse=True,
     ):
         print(
-            f"{setup:<30} "
+            f"{setup:<35} "
             f"{count:>5}"
         )
 
     # --------------------------------------------------
-    # 9. Detailed tags
+    # 11. Summary
     # --------------------------------------------------
 
-    print()
-    print("TOP ANOMALY TAGS")
-    print("-" * 100)
-
-    for result in results[
-        :args.show
-    ]:
-        ticker = result["ticker"]
-
-        classification = result[
-            "classification"
-        ]
-
-        tags = ", ".join(
-            classification.tags
+    research_matched = sum(
+        1
+        for result in results
+        if result.get(
+            "best_research_match"
         )
-
-        if not tags:
-            tags = (
-                "UNCLASSIFIED_ANOMALY"
-            )
-
-        print(
-            f"{ticker:<8} "
-            f"{tags}"
-        )
-
-    # --------------------------------------------------
-    # 10. Summary
-    # --------------------------------------------------
+        is not None
+    )
 
     print()
-    print("=" * 70)
+    print("=" * 80)
 
     print(
-        f"Eligible common stocks:  "
-        f"{len(eligible_symbols):>6,}"
+        f"Eligible common stocks:    "
+        f"{len(eligible_symbols):>8,}"
     )
 
     print(
-        f"Grouped-market symbols: "
-        f"{grouped_symbols:>6,}"
+        f"Grouped-market symbols:   "
+        f"{grouped_symbols:>8,}"
     )
 
     print(
-        f"Broad candidates:       "
-        f"{len(prefiltered):>6,}"
+        f"Broad candidates:         "
+        f"{len(prefiltered):>8,}"
     )
 
     print(
-        f"Deep analyzed:          "
-        f"{len(selected):>6,}"
+        f"Deep analyzed:            "
+        f"{len(selected):>8,}"
     )
 
     print(
-        f"Final anomalies:        "
-        f"{len(results):>6,}"
+        f"Final anomalies:          "
+        f"{len(results):>8,}"
     )
 
-    print("=" * 70)
+    print(
+        f"Research-matched:         "
+        f"{research_matched:>8,}"
+    )
+
+    print(
+        f"Validated archetypes:     "
+        f"{research_archetype_count:>8,}"
+    )
+
+    print("=" * 80)
 
     print()
+    print(
+        "OOS metrics shown above are historical "
+        "contrarian research results."
+    )
+
+    print(
+        "They are evidence summaries, not forecasts "
+        "or trading recommendations."
+    )
+
+    print()
+
     print(
         "Full single-stock analysis:"
     )
