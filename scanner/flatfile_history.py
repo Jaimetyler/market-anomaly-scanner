@@ -51,6 +51,25 @@ def _date_from_path(path: Path) -> date:
     return date.fromisoformat(name[:-7])
 
 
+def _ticker_from_row(row: dict[str, str]) -> str:
+    """
+    Return the provider ticker exactly as supplied, aside from whitespace.
+
+    Massive flat files can contain distinct ticker identifiers that differ only
+    by letter case. Ticker identity therefore MUST remain case-sensitive here.
+
+    Example:
+        BCpC != BCPC
+
+    Uppercasing provider symbols would collapse those two securities and can
+    cause one security's OHLCV history to be assigned to another.
+    """
+    ticker = (row.get("ticker") or "").strip()
+    if not ticker:
+        raise ValueError("Missing ticker")
+    return ticker
+
+
 def iter_local_day_aggregate_files(
     start_date: str | date,
     end_date: str | date,
@@ -101,9 +120,7 @@ def _float_or_none(row: dict[str, str], key: str) -> float | None:
 
 
 def _parse_row(row: dict[str, str], session: date) -> FlatFileBar:
-    ticker = (row.get("ticker") or "").strip().upper()
-    if not ticker:
-        raise ValueError("Missing ticker")
+    ticker = _ticker_from_row(row)
 
     window_start = row.get("window_start")
     if window_start is None or window_start == "":
@@ -130,17 +147,32 @@ def read_ticker_history(
     *,
     root: str | Path | None = None,
 ) -> list[FlatFileBar]:
-    symbol = ticker.strip().upper()
+    symbol = ticker.strip()
     if not symbol:
         raise ValueError("ticker must not be empty")
 
     bars: list[FlatFileBar] = []
-    for path in iter_local_day_aggregate_files(start_date, end_date, root=root):
+
+    for path in iter_local_day_aggregate_files(
+        start_date,
+        end_date,
+        root=root,
+    ):
         session = _date_from_path(path)
-        with gzip.open(path, "rt", newline="", encoding="utf-8") as handle:
+
+        with gzip.open(
+            path,
+            "rt",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
             reader = csv.DictReader(handle)
+
             for row in reader:
-                if (row.get("ticker") or "").strip().upper() == symbol:
+                row_ticker = (row.get("ticker") or "").strip()
+
+                # Provider ticker identity is case-sensitive.
+                if row_ticker == symbol:
                     bars.append(_parse_row(row, session))
                     break
 
@@ -155,32 +187,55 @@ def read_many_ticker_histories(
     root: str | Path | None = None,
     progress: bool = False,
 ) -> dict[str, list[FlatFileBar]]:
-    wanted = {ticker.strip().upper() for ticker in tickers if ticker.strip()}
+    wanted = {
+        ticker.strip()
+        for ticker in tickers
+        if ticker.strip()
+    }
+
     if not wanted:
         return {}
 
-    result: dict[str, list[FlatFileBar]] = {ticker: [] for ticker in sorted(wanted)}
-    paths = iter_local_day_aggregate_files(start_date, end_date, root=root)
+    result: dict[str, list[FlatFileBar]] = {
+        ticker: []
+        for ticker in sorted(wanted)
+    }
+
+    paths = iter_local_day_aggregate_files(
+        start_date,
+        end_date,
+        root=root,
+    )
     total = len(paths)
 
     for i, path in enumerate(paths, start=1):
         session = _date_from_path(path)
-        found = 0
+        found: set[str] = set()
 
-        with gzip.open(path, "rt", newline="", encoding="utf-8") as handle:
+        with gzip.open(
+            path,
+            "rt",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
             reader = csv.DictReader(handle)
+
             for row in reader:
-                ticker = (row.get("ticker") or "").strip().upper()
-                if ticker in wanted:
-                    result[ticker].append(_parse_row(row, session))
-                    found += 1
-                    if found == len(wanted):
+                ticker = (row.get("ticker") or "").strip()
+
+                if ticker in wanted and ticker not in found:
+                    result[ticker].append(
+                        _parse_row(row, session)
+                    )
+                    found.add(ticker)
+
+                    if len(found) == len(wanted):
                         break
 
         if progress:
             print(
                 f"[{i:>4}/{total:<4}] {session.isoformat()} "
-                f"matched={found:>4}/{len(wanted)}"
+                f"matched={len(found):>4}/{len(wanted)}"
             )
 
     return result

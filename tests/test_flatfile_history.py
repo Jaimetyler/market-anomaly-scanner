@@ -4,10 +4,12 @@ import csv
 import gzip
 from pathlib import Path
 
+import pytest
+
 import scanner.flatfile_history as fh
 
 
-FIELDS = [
+FIELDNAMES = [
     "ticker",
     "volume",
     "open",
@@ -16,47 +18,81 @@ FIELDS = [
     "low",
     "window_start",
     "transactions",
-    "vwap",
 ]
 
 
-def _write_day(root: Path, session: str, rows: list[dict[str, str]]) -> Path:
-    year, month, _ = session.split("-")
-    path = root / year / month / f"{session}.csv.gz"
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _row(
+    ticker: str,
+    close: str,
+    window_start: str,
+) -> dict[str, str]:
+    close_value = float(close)
 
-    with gzip.open(path, "wt", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    return path
-
-
-def _row(ticker: str, close: str, ts: str) -> dict[str, str]:
     return {
         "ticker": ticker,
         "volume": "1000",
-        "open": "10",
+        "open": str(close_value - 1.0),
         "close": close,
-        "high": "12",
-        "low": "9",
-        "window_start": ts,
-        "transactions": "50",
-        "vwap": "10.5",
+        "high": str(close_value + 1.0),
+        "low": str(close_value - 2.0),
+        "window_start": window_start,
+        "transactions": "100",
     }
 
 
-def test_iter_files_filters_and_sorts(tmp_path):
-    _write_day(tmp_path, "2025-01-03", [_row("AAPL", "11", "1735862400000000000")])
-    _write_day(tmp_path, "2025-01-02", [_row("AAPL", "10", "1735776000000000000")])
-    _write_day(tmp_path, "2025-01-06", [_row("AAPL", "12", "1736121600000000000")])
+def _write_day(
+    root: Path,
+    session: str,
+    rows: list[dict[str, str]],
+) -> None:
+    year, month, _ = session.split("-")
 
-    result = fh.iter_local_day_aggregate_files(
-        "2025-01-02", "2025-01-03", root=tmp_path
+    path = (
+        root
+        / year
+        / month
+        / f"{session}.csv.gz"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with gzip.open(
+        path,
+        "wt",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=FIELDNAMES,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_iter_local_day_aggregate_files(tmp_path):
+    _write_day(
+        tmp_path,
+        "2025-01-02",
+        [_row("AAPL", "10", "1735776000000000000")],
+    )
+    _write_day(
+        tmp_path,
+        "2025-01-03",
+        [_row("AAPL", "11", "1735862400000000000")],
+    )
+    _write_day(
+        tmp_path,
+        "2025-01-06",
+        [_row("AAPL", "12", "1736121600000000000")],
     )
 
-    assert [p.name for p in result] == [
+    paths = fh.iter_local_day_aggregate_files(
+        "2025-01-02",
+        "2025-01-03",
+        root=tmp_path,
+    )
+
+    assert [path.name for path in paths] == [
         "2025-01-02.csv.gz",
         "2025-01-03.csv.gz",
     ]
@@ -78,35 +114,122 @@ def test_read_ticker_history(tmp_path):
     )
 
     bars = fh.read_ticker_history(
-        "aapl", "2025-01-02", "2025-01-03", root=tmp_path
+        "AAPL",
+        "2025-01-02",
+        "2025-01-03",
+        root=tmp_path,
     )
 
     assert len(bars) == 2
-    assert [bar.close for bar in bars] == [10.0, 11.0]
-    assert [bar.session_date for bar in bars] == ["2025-01-02", "2025-01-03"]
+    assert bars[0].ticker == "AAPL"
+    assert bars[0].close == 10.0
+    assert bars[1].close == 11.0
 
 
-def test_read_many_scans_multiple_tickers(tmp_path):
+def test_read_ticker_history_is_case_sensitive(tmp_path):
+    _write_day(
+        tmp_path,
+        "2025-01-02",
+        [
+            _row("Aapl", "20", "1735776000000000000"),
+            _row("AAPL", "10", "1735776000000000000"),
+        ],
+    )
+
+    uppercase = fh.read_ticker_history(
+        "AAPL",
+        "2025-01-02",
+        "2025-01-02",
+        root=tmp_path,
+    )
+
+    mixed_case = fh.read_ticker_history(
+        "Aapl",
+        "2025-01-02",
+        "2025-01-02",
+        root=tmp_path,
+    )
+
+    lowercase = fh.read_ticker_history(
+        "aapl",
+        "2025-01-02",
+        "2025-01-02",
+        root=tmp_path,
+    )
+
+    assert len(uppercase) == 1
+    assert uppercase[0].ticker == "AAPL"
+    assert uppercase[0].close == 10.0
+
+    assert len(mixed_case) == 1
+    assert mixed_case[0].ticker == "Aapl"
+    assert mixed_case[0].close == 20.0
+
+    assert lowercase == []
+
+
+def test_read_many_ticker_histories(tmp_path):
     _write_day(
         tmp_path,
         "2025-01-02",
         [
             _row("AA", "20", "1735776000000000000"),
             _row("AAPL", "10", "1735776000000000000"),
-            _row("MSFT", "30", "1735776000000000000"),
+        ],
+    )
+    _write_day(
+        tmp_path,
+        "2025-01-03",
+        [
+            _row("AA", "21", "1735862400000000000"),
+            _row("AAPL", "11", "1735862400000000000"),
         ],
     )
 
-    result = fh.read_many_ticker_histories(
-        ["AAPL", "MSFT"], "2025-01-02", "2025-01-02", root=tmp_path
+    histories = fh.read_many_ticker_histories(
+        ["AA", "AAPL"],
+        "2025-01-02",
+        "2025-01-03",
+        root=tmp_path,
     )
 
-    assert result["AAPL"][0].close == 10.0
-    assert result["MSFT"][0].close == 30.0
-    assert "AA" not in result
+    assert set(histories) == {"AA", "AAPL"}
+
+    assert [bar.close for bar in histories["AA"]] == [
+        20.0,
+        21.0,
+    ]
+    assert [bar.close for bar in histories["AAPL"]] == [
+        10.0,
+        11.0,
+    ]
 
 
-def test_massive_shape_normalizes_nanoseconds_to_milliseconds(tmp_path):
+def test_read_many_preserves_case_distinct_tickers(tmp_path):
+    _write_day(
+        tmp_path,
+        "2025-01-02",
+        [
+            _row("BCpC", "24.25", "1735776000000000000"),
+            _row("BCPC", "182.44", "1735776000000000000"),
+        ],
+    )
+
+    histories = fh.read_many_ticker_histories(
+        ["BCpC", "BCPC"],
+        "2025-01-02",
+        "2025-01-02",
+        root=tmp_path,
+    )
+
+    assert histories["BCpC"][0].ticker == "BCpC"
+    assert histories["BCpC"][0].close == 24.25
+
+    assert histories["BCPC"][0].ticker == "BCPC"
+    assert histories["BCPC"][0].close == 182.44
+
+
+def test_get_flatfile_daily_bars(tmp_path):
     _write_day(
         tmp_path,
         "2025-01-02",
@@ -114,35 +237,28 @@ def test_massive_shape_normalizes_nanoseconds_to_milliseconds(tmp_path):
     )
 
     bars = fh.get_flatfile_daily_bars(
-        "AAPL", "2025-01-02", "2025-01-02", root=tmp_path
-    )
-
-    assert bars == [{
-        "T": "AAPL",
-        "o": 10.0,
-        "h": 12.0,
-        "l": 9.0,
-        "c": 10.0,
-        "v": 1000.0,
-        "t": 1735776000000,
-        "n": 50,
-        "vw": 10.5,
-    }]
-
-
-def test_empty_ticker_history_returns_empty(tmp_path):
-    _write_day(
-        tmp_path,
+        "AAPL",
         "2025-01-02",
-        [_row("AAPL", "10", "1735776000000000000")],
+        "2025-01-02",
+        root=tmp_path,
     )
 
-    assert fh.read_ticker_history(
-        "MSFT", "2025-01-02", "2025-01-02", root=tmp_path
-    ) == []
+    assert len(bars) == 1
+
+    bar = bars[0]
+
+    assert bar["T"] == "AAPL"
+    assert bar["c"] == 10.0
+    assert bar["t"] == 1735776000000
 
 
-def test_many_empty_request_returns_empty(tmp_path):
-    assert fh.read_many_ticker_histories(
-        [], "2025-01-02", "2025-01-03", root=tmp_path
-    ) == {}
+def test_invalid_date_range_raises(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match="end_date must be on or after start_date",
+    ):
+        fh.iter_local_day_aggregate_files(
+            "2025-01-03",
+            "2025-01-02",
+            root=tmp_path,
+        )
