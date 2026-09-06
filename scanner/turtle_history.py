@@ -24,6 +24,11 @@ DEFAULT_DISCONTINUITY_THRESHOLD = 0.35
 # 2020-12-01 crosses a confirmed corporate-separation / security-lineage
 # boundary.
 #
+# AAC:
+# 2021-03-25 begins a different security lineage under the AAC ticker.
+# The earlier 2019 history belongs to a different security and must not
+# be treated as continuous price history.
+#
 # Keep this registry intentionally small and auditable.
 CONFIRMED_LINEAGE_BREAKS: dict[str, frozenset[str]] = {
     "AABA": frozenset(
@@ -34,6 +39,11 @@ CONFIRMED_LINEAGE_BREAKS: dict[str, frozenset[str]] = {
     "AAN": frozenset(
         {
             "2020-12-01",
+        }
+    ),
+    "AAC": frozenset(
+        {
+            "2021-03-25",
         }
     ),
 }
@@ -485,3 +495,90 @@ def split_continuous_history(
         )
 
     return segments, breaks
+
+
+@dataclass(frozen=True)
+class TurtleHistoryAudit:
+    ticker: str
+    break_index: int
+    previous_date: str | None
+    new_date: str | None
+    previous_close: float
+    new_open: float
+    open_gap_pct: float
+    classification: str
+    reason: str
+    evidence: str
+    confirmed_break: bool
+
+
+def audit_history_candidates(
+    bars,
+    *,
+    ticker: str,
+    dividends=(),
+    discontinuity_threshold: float = DEFAULT_DISCONTINUITY_THRESHOLD,
+) -> list[TurtleHistoryAudit]:
+    """
+    Classify every large-gap history candidate.
+
+    Important:
+    - Large price movement alone never confirms a break.
+    - Confirmed corporate-action/history boundaries are marked as breaks.
+    - Unexplained large gaps remain tradable and are surfaced for audit.
+    """
+    candidates = find_discontinuity_candidates(
+        bars,
+        threshold=discontinuity_threshold,
+    )
+
+    confirmed_breaks = find_history_breaks(
+        bars,
+        ticker=ticker,
+        dividends=dividends,
+        threshold=discontinuity_threshold,
+    )
+
+    confirmed_by_index = {
+        item.break_index: item
+        for item in confirmed_breaks
+    }
+
+    rows: list[TurtleHistoryAudit] = []
+
+    for candidate in candidates:
+        confirmed = confirmed_by_index.get(
+            candidate.break_index
+        )
+
+        if confirmed is not None:
+            classification = confirmed.reason
+            reason = confirmed.reason
+            evidence = confirmed.evidence
+            confirmed_break = True
+        else:
+            classification = "UNCONFIRMED_LARGE_GAP"
+            reason = candidate.candidate_reason
+            evidence = (
+                "No confirmed corporate-action or manually "
+                "researched history-boundary evidence."
+            )
+            confirmed_break = False
+
+        rows.append(
+            TurtleHistoryAudit(
+                ticker=ticker,
+                break_index=candidate.break_index,
+                previous_date=candidate.previous_date,
+                new_date=candidate.new_date,
+                previous_close=candidate.previous_close,
+                new_open=candidate.new_open,
+                open_gap_pct=candidate.open_gap_pct,
+                classification=classification,
+                reason=reason,
+                evidence=evidence,
+                confirmed_break=confirmed_break,
+            )
+        )
+
+    return rows

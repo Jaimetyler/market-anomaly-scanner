@@ -17,7 +17,10 @@ from scanner.corporate_actions import (
 from scanner.flatfile_adjustments import adjust_flatfile_history_for_splits
 from scanner.flatfile_history import read_many_ticker_histories
 from scanner.turtle import SYSTEM_1, SYSTEM_2, TurtleSystem
-from scanner.turtle_history import split_continuous_history
+from scanner.turtle_history import (
+    audit_history_candidates,
+    split_continuous_history,
+)
 from scanner.turtle_portfolio import (
     TurtlePortfolioConfig,
     run_turtle_portfolio,
@@ -727,6 +730,10 @@ def main() -> None:
         dict[str, Any]
     ] = []
 
+    history_audit_rows: list[
+        dict[str, Any]
+    ] = []
+
     dated_trades_by_system: dict[
         str,
         list[
@@ -795,6 +802,42 @@ def main() -> None:
                     ticker
                 )
             )
+
+            candidate_audits = (
+                audit_history_candidates(
+                    bars,
+                    ticker=ticker,
+                    dividends=dividend_events,
+                )
+            )
+
+            for audit in candidate_audits:
+                history_audit_rows.append(
+                    {
+                        "ticker": audit.ticker,
+                        "previous_date": (
+                            audit.previous_date or ""
+                        ),
+                        "new_date": (
+                            audit.new_date or ""
+                        ),
+                        "previous_close": (
+                            audit.previous_close
+                        ),
+                        "new_open": audit.new_open,
+                        "open_gap_pct": (
+                            audit.open_gap_pct
+                        ),
+                        "classification": (
+                            audit.classification
+                        ),
+                        "reason": audit.reason,
+                        "evidence": audit.evidence,
+                        "confirmed_break": (
+                            audit.confirmed_break
+                        ),
+                    }
+                )
 
             segments, history_breaks = (
                 split_continuous_history(
@@ -1152,6 +1195,71 @@ def main() -> None:
 
         print()
 
+    audit_path = (
+        trades_path.parent
+        / "history_candidate_audit.csv"
+    )
+
+    audit_fieldnames = [
+        "ticker",
+        "previous_date",
+        "new_date",
+        "previous_close",
+        "new_open",
+        "open_gap_pct",
+        "classification",
+        "reason",
+        "evidence",
+        "confirmed_break",
+    ]
+
+    history_audit_rows.sort(
+        key=lambda row: abs(
+            float(row["open_gap_pct"])
+        ),
+        reverse=True,
+    )
+
+    with audit_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=audit_fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(
+            history_audit_rows
+        )
+
+    confirmed_audit_count = sum(
+        1
+        for row in history_audit_rows
+        if row["confirmed_break"]
+    )
+
+    unconfirmed_audit_count = (
+        len(history_audit_rows)
+        - confirmed_audit_count
+    )
+
+    print("History gap audit:")
+    print(
+        "  Large-gap candidates: "
+        f"{len(history_audit_rows):,}"
+    )
+    print(
+        "  Confirmed breaks:      "
+        f"{confirmed_audit_count:,}"
+    )
+    print(
+        "  Unconfirmed / kept:    "
+        f"{unconfirmed_audit_count:,}"
+    )
+    print()
+
     print("Reports:")
     print(
         f"  {trades_path}"
@@ -1164,6 +1272,9 @@ def main() -> None:
     )
     print(
         f"  {equity_path}"
+    )
+    print(
+        f"  {audit_path}"
     )
     print()
     print(

@@ -363,3 +363,123 @@ def test_threshold_validation():
             bars,
             threshold=0.0,
         )
+
+
+
+def test_audit_marks_real_market_gap_unconfirmed():
+    from scanner.turtle_history import (
+        audit_history_candidates,
+    )
+
+    bars = [
+        bar(
+            "2025-03-13",
+            open_=10.00,
+            high=10.50,
+            low=9.80,
+            close=10.00,
+        ),
+        bar(
+            "2025-03-14",
+            open_=15.00,
+            high=16.00,
+            low=14.80,
+            close=15.50,
+        ),
+    ]
+
+    rows = audit_history_candidates(
+        bars,
+        ticker="AAOI",
+        dividends=[],
+    )
+
+    assert len(rows) == 1
+
+    assert (
+        rows[0].classification
+        == "UNCONFIRMED_LARGE_GAP"
+    )
+
+    assert (
+        rows[0].confirmed_break
+        is False
+    )
+
+
+def test_audit_marks_aaba_manual_break_confirmed():
+    from scanner.turtle_history import (
+        audit_history_candidates,
+    )
+
+    bars = [
+        bar(
+            "2019-09-23",
+            open_=70.41,
+            high=70.845,
+            low=70.40,
+            close=70.80,
+        ),
+        bar(
+            "2019-09-24",
+            open_=19.32,
+            high=19.66,
+            low=19.25,
+            close=19.51,
+        ),
+    ]
+
+    rows = audit_history_candidates(
+        bars,
+        ticker="AABA",
+        dividends=[],
+    )
+
+    assert len(rows) == 1
+
+    assert (
+        rows[0].confirmed_break
+        is True
+    )
+
+    assert (
+        rows[0].classification
+        == "CONFIRMED_LINEAGE_EVENT"
+    )
+
+
+def test_aac_ticker_reuse_confirms_lineage_break():
+    bars = [
+        bar(
+            "2019-10-25",
+            open_=0.70,
+            high=0.72,
+            low=0.68,
+            close=0.70,
+        ),
+        bar(
+            "2021-03-25",
+            open_=14.51,
+            high=15.00,
+            low=14.00,
+            close=14.50,
+        ),
+    ]
+
+    breaks = find_history_breaks(
+        bars,
+        ticker="AAC",
+    )
+
+    assert len(breaks) == 1
+
+    assert (
+        breaks[0].new_date
+        == "2021-03-25"
+    )
+
+    assert (
+        breaks[0].reason
+        == "CONFIRMED_LINEAGE_EVENT"
+    )
+
