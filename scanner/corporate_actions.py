@@ -506,3 +506,340 @@ def check_corporate_action_risk(
         reasons=reasons,
         nearby_actions=nearby,
     )
+
+# ============================================================================
+# CASH DIVIDENDS
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class DividendEvent:
+    ticker: str
+    ex_dividend_date: date
+    cash_amount: float | None = None
+    split_adjusted_cash_amount: float | None = None
+    distribution_type: str | None = None
+    historical_adjustment_factor: float | None = None
+    declaration_date: date | None = None
+    record_date: date | None = None
+    pay_date: date | None = None
+    raw: dict[str, Any] | None = None
+
+
+def _optional_date(
+    value: Any,
+) -> date | None:
+    if value in (
+        None,
+        "",
+    ):
+        return None
+
+    return _normalize_date(
+        value
+    )
+
+
+def parse_dividend_event(
+    raw: dict[str, Any],
+) -> DividendEvent:
+    ex_date = raw.get(
+        "ex_dividend_date"
+    )
+
+    if ex_date is None:
+        raise ValueError(
+            "Dividend event is missing ex_dividend_date."
+        )
+
+    cash_amount = raw.get(
+        "cash_amount"
+    )
+
+    split_adjusted = raw.get(
+        "split_adjusted_cash_amount"
+    )
+
+    historical_factor = raw.get(
+        "historical_adjustment_factor"
+    )
+
+    return DividendEvent(
+        ticker=str(
+            raw.get(
+                "ticker",
+                "",
+            )
+        ),
+        ex_dividend_date=(
+            _normalize_date(
+                ex_date
+            )
+        ),
+        cash_amount=(
+            float(cash_amount)
+            if cash_amount is not None
+            else None
+        ),
+        split_adjusted_cash_amount=(
+            float(split_adjusted)
+            if split_adjusted is not None
+            else None
+        ),
+        distribution_type=(
+            str(
+                raw[
+                    "distribution_type"
+                ]
+            )
+            if raw.get(
+                "distribution_type"
+            )
+            is not None
+            else None
+        ),
+        historical_adjustment_factor=(
+            float(
+                historical_factor
+            )
+            if historical_factor
+            is not None
+            else None
+        ),
+        declaration_date=(
+            _optional_date(
+                raw.get(
+                    "declaration_date"
+                )
+            )
+        ),
+        record_date=(
+            _optional_date(
+                raw.get(
+                    "record_date"
+                )
+            )
+        ),
+        pay_date=(
+            _optional_date(
+                raw.get(
+                    "pay_date"
+                )
+            )
+        ),
+        raw=raw,
+    )
+
+
+def _dividend_cache_path(
+    ticker: str,
+) -> Path:
+    safe_ticker = (
+        ticker
+        .strip()
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+
+    return (
+        CACHE_DIR
+        / f"{safe_ticker}_dividends.json"
+    )
+
+
+def _load_dividend_cache(
+    ticker: str,
+) -> list[dict[str, Any]] | None:
+    path = (
+        _dividend_cache_path(
+            ticker
+        )
+    )
+
+    if not path.exists():
+        return None
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            payload = json.load(
+                handle
+            )
+
+        if not isinstance(
+            payload,
+            list,
+        ):
+            return None
+
+        return payload
+
+    except Exception:
+        return None
+
+
+def _save_dividend_cache(
+    ticker: str,
+    dividends: list[
+        dict[str, Any]
+    ],
+) -> None:
+    CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path = (
+        _dividend_cache_path(
+            ticker
+        )
+    )
+
+    temp = path.with_suffix(
+        path.suffix
+        + ".tmp"
+    )
+
+    with temp.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            dividends,
+            handle,
+            indent=2,
+        )
+
+    temp.replace(
+        path
+    )
+
+
+def get_stock_dividends(
+    ticker: str,
+    force_refresh: bool = False,
+) -> list[DividendEvent]:
+    """
+    Retrieve Massive cash-dividend records for one exact-case ticker.
+
+    Endpoint:
+        GET /stocks/v1/dividends
+
+    Unlike the legacy split helper above, this intentionally preserves
+    provider ticker case.
+    """
+
+    ticker = ticker.strip()
+
+    if not ticker:
+        raise ValueError(
+            "Ticker cannot be empty."
+        )
+
+    if not force_refresh:
+        cached = (
+            _load_dividend_cache(
+                ticker
+            )
+        )
+
+        if cached is not None:
+            return [
+                parse_dividend_event(
+                    item
+                )
+                for item in cached
+            ]
+
+    url = (
+        f"{BASE_URL}"
+        "/stocks/v1/dividends"
+    )
+
+    params: dict[
+        str,
+        Any,
+    ] = {
+        "ticker": ticker,
+        "limit": 1000,
+        "sort": (
+            "ex_dividend_date.asc"
+        ),
+        "apiKey": MASSIVE_API_KEY,
+    }
+
+    raw_events: list[
+        dict[str, Any]
+    ] = []
+
+    with httpx.Client(
+        timeout=30.0,
+    ) as client:
+        next_url: (
+            str
+            | None
+        ) = url
+
+        first_page = True
+
+        while next_url:
+            if first_page:
+                response = client.get(
+                    next_url,
+                    params=params,
+                )
+
+                first_page = False
+
+            else:
+                response = client.get(
+                    next_url,
+                    params={
+                        "apiKey": (
+                            MASSIVE_API_KEY
+                        )
+                    },
+                )
+
+            response.raise_for_status()
+
+            payload = (
+                response.json()
+            )
+
+            results = payload.get(
+                "results",
+                [],
+            )
+
+            if isinstance(
+                results,
+                list,
+            ):
+                raw_events.extend(
+                    item
+                    for item in results
+                    if isinstance(
+                        item,
+                        dict,
+                    )
+                )
+
+            next_url = payload.get(
+                "next_url"
+            )
+
+    _save_dividend_cache(
+        ticker,
+        raw_events,
+    )
+
+    return [
+        parse_dividend_event(
+            item
+        )
+        for item in raw_events
+    ]
