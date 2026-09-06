@@ -33,6 +33,8 @@ def bar(
     }
 
 
+from scanner.turtle_history import audit_history_candidates
+
 def test_overnight_gap_pct():
     previous = bar(
         "2020-01-01",
@@ -483,3 +485,98 @@ def test_aac_ticker_reuse_confirms_lineage_break():
         == "CONFIRMED_LINEAGE_EVENT"
     )
 
+
+
+
+def test_acet_ticker_reuse_confirms_lineage_break():
+    bars = [
+        bar(
+            "2019-04-02",
+            open_=2.10,
+            high=2.20,
+            low=2.00,
+            close=2.152,
+        ),
+        bar(
+            "2020-09-16",
+            open_=256.00,
+            high=260.00,
+            low=250.00,
+            close=255.00,
+        ),
+    ]
+
+    breaks = find_history_breaks(
+        bars,
+        ticker="ACET",
+    )
+
+    assert len(breaks) == 1
+    assert breaks[0].new_date == "2020-09-16"
+    assert (
+        breaks[0].reason
+        == "CONFIRMED_LINEAGE_EVENT"
+    )
+
+
+def test_audit_prioritizes_long_unconfirmed_gap():
+    bars = [
+        bar(
+            "2020-01-01",
+            open_=10.0,
+            high=10.5,
+            low=9.5,
+            close=10.0,
+        ),
+        bar(
+            "2020-05-01",
+            open_=15.0,
+            high=15.5,
+            low=14.5,
+            close=15.0,
+        ),
+    ]
+
+    rows = audit_history_candidates(
+        bars,
+        ticker="TEST",
+    )
+
+    assert len(rows) == 1
+    assert rows[0].confirmed_break is False
+    assert rows[0].calendar_gap_days == 121
+    assert (
+        rows[0].review_priority
+        == "CRITICAL_LINEAGE_REVIEW"
+    )
+
+
+def test_audit_prioritizes_large_short_gap():
+    bars = [
+        bar(
+            "2020-01-01",
+            open_=10.0,
+            high=10.5,
+            low=9.5,
+            close=10.0,
+        ),
+        bar(
+            "2020-01-02",
+            open_=21.0,
+            high=22.0,
+            low=20.0,
+            close=21.0,
+        ),
+    ]
+
+    rows = audit_history_candidates(
+        bars,
+        ticker="TEST",
+    )
+
+    assert len(rows) == 1
+    assert rows[0].calendar_gap_days == 1
+    assert (
+        rows[0].review_priority
+        == "LARGE_GAP_REVIEW"
+    )

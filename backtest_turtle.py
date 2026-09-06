@@ -828,6 +828,12 @@ def main() -> None:
                         "open_gap_pct": (
                             audit.open_gap_pct
                         ),
+                        "calendar_gap_days": (
+                            audit.calendar_gap_days
+                        ),
+                        "review_priority": (
+                            audit.review_priority
+                        ),
                         "classification": (
                             audit.classification
                         ),
@@ -1207,15 +1213,28 @@ def main() -> None:
         "previous_close",
         "new_open",
         "open_gap_pct",
+        "calendar_gap_days",
+        "review_priority",
         "classification",
         "reason",
         "evidence",
         "confirmed_break",
     ]
 
+    review_priority_rank = {
+        "CRITICAL_LINEAGE_REVIEW": 3,
+        "LARGE_GAP_REVIEW": 2,
+        "NORMAL_GAP_REVIEW": 1,
+        "CONFIRMED_BREAK": 0,
+    }
+
     history_audit_rows.sort(
-        key=lambda row: abs(
-            float(row["open_gap_pct"])
+        key=lambda row: (
+            review_priority_rank.get(
+                str(row["review_priority"]),
+                -1,
+            ),
+            abs(float(row["open_gap_pct"])),
         ),
         reverse=True,
     )

@@ -29,6 +29,11 @@ DEFAULT_DISCONTINUITY_THRESHOLD = 0.35
 # The earlier 2019 history belongs to a different security and must not
 # be treated as continuous price history.
 #
+# ACET:
+# 2020-09-16 begins a different security lineage under the ACET ticker
+# following the Adicet / resTORbio merger and symbol transition.
+# Earlier ACET history must not be stitched into this security.
+#
 # Keep this registry intentionally small and auditable.
 CONFIRMED_LINEAGE_BREAKS: dict[str, frozenset[str]] = {
     "AABA": frozenset(
@@ -44,6 +49,11 @@ CONFIRMED_LINEAGE_BREAKS: dict[str, frozenset[str]] = {
     "AAC": frozenset(
         {
             "2021-03-25",
+        }
+    ),
+    "ACET": frozenset(
+        {
+            "2020-09-16",
         }
     ),
 }
@@ -506,10 +516,54 @@ class TurtleHistoryAudit:
     previous_close: float
     new_open: float
     open_gap_pct: float
+    calendar_gap_days: int | None
+    review_priority: str
     classification: str
     reason: str
     evidence: str
     confirmed_break: bool
+
+
+
+def _calendar_gap_days(
+    previous_date: str | None,
+    new_date: str | None,
+) -> int | None:
+    if not previous_date or not new_date:
+        return None
+
+    try:
+        previous = date.fromisoformat(
+            previous_date
+        )
+        new = date.fromisoformat(
+            new_date
+        )
+    except ValueError:
+        return None
+
+    return (new - previous).days
+
+
+def _history_review_priority(
+    *,
+    confirmed_break: bool,
+    calendar_gap_days: int | None,
+    open_gap_pct: float,
+) -> str:
+    if confirmed_break:
+        return "CONFIRMED_BREAK"
+
+    if (
+        calendar_gap_days is not None
+        and calendar_gap_days >= 90
+    ):
+        return "CRITICAL_LINEAGE_REVIEW"
+
+    if abs(open_gap_pct) >= 100.0:
+        return "LARGE_GAP_REVIEW"
+
+    return "NORMAL_GAP_REVIEW"
 
 
 def audit_history_candidates(
@@ -565,6 +619,17 @@ def audit_history_candidates(
             )
             confirmed_break = False
 
+        calendar_gap_days = _calendar_gap_days(
+            candidate.previous_date,
+            candidate.new_date,
+        )
+
+        review_priority = _history_review_priority(
+            confirmed_break=confirmed_break,
+            calendar_gap_days=calendar_gap_days,
+            open_gap_pct=candidate.open_gap_pct,
+        )
+
         rows.append(
             TurtleHistoryAudit(
                 ticker=ticker,
@@ -574,6 +639,8 @@ def audit_history_candidates(
                 previous_close=candidate.previous_close,
                 new_open=candidate.new_open,
                 open_gap_pct=candidate.open_gap_pct,
+                calendar_gap_days=calendar_gap_days,
+                review_priority=review_priority,
                 classification=classification,
                 reason=reason,
                 evidence=evidence,
