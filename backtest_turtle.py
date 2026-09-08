@@ -22,7 +22,10 @@ from scanner.turtle_history import (
     split_continuous_history,
 )
 from scanner.turtle_portfolio import (
+    TurtleChronologicalConfig,
+    TurtleDatedTrade,
     TurtlePortfolioConfig,
+    run_chronological_turtle_portfolio,
     run_turtle_portfolio,
 )
 from scanner.turtle_simulation import (
@@ -101,6 +104,26 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Fraction of current equity allocated to "
             "one 1N unit. Default = 0.01."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-total-units",
+        type=int,
+        default=12,
+        help=(
+            "Maximum active Turtle units across the whole account. "
+            "Default = 12."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-direction-units",
+        type=int,
+        default=12,
+        help=(
+            "Maximum active units in one direction (LONG or SHORT). "
+            "Default = 12."
         ),
     )
 
@@ -637,6 +660,245 @@ def _build_system_rows(
     )
 
 
+def _build_chronological_rows(
+    *,
+    dated_trades_by_system: dict[
+        str,
+        list[
+            tuple[
+                str,
+                str,
+                TurtleTrade,
+            ]
+        ],
+    ],
+    starting_equity: float,
+    risk_fraction: float,
+    max_total_units: int,
+    max_direction_units: int,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    summary_rows: list[
+        dict[str, Any]
+    ] = []
+
+    equity_rows: list[
+        dict[str, Any]
+    ] = []
+
+    accepted_rows: list[
+        dict[str, Any]
+    ] = []
+
+    skipped_rows: list[
+        dict[str, Any]
+    ] = []
+
+    for system_name in sorted(
+        dated_trades_by_system
+    ):
+        ordered = sorted(
+            dated_trades_by_system[
+                system_name
+            ],
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2].entry_index,
+            ),
+        )
+
+        candidates = [
+            TurtleDatedTrade(
+                ticker=ticker,
+                trade=trade,
+            )
+            for _entry_date, ticker, trade
+            in ordered
+        ]
+
+        result = (
+            run_chronological_turtle_portfolio(
+                candidates,
+                config=(
+                    TurtleChronologicalConfig(
+                        starting_equity=(
+                            starting_equity
+                        ),
+                        risk_fraction_per_unit=(
+                            risk_fraction
+                        ),
+                        max_total_units=(
+                            max_total_units
+                        ),
+                        max_direction_units=(
+                            max_direction_units
+                        ),
+                    )
+                ),
+            )
+        )
+
+        summary_rows.append(
+            {
+                "system": system_name,
+                "candidates": len(candidates),
+                "accepted_trades": len(
+                    result.accepted_trades
+                ),
+                "skipped_trades": len(
+                    result.skipped_trades
+                ),
+                "starting_equity": (
+                    result.starting_equity
+                ),
+                "ending_realized_equity": (
+                    result.ending_equity
+                ),
+                "realized_return_pct": (
+                    result.total_return_pct
+                ),
+                "max_realized_drawdown_pct": (
+                    result.max_realized_drawdown_pct
+                ),
+                "max_concurrent_positions": (
+                    result.max_concurrent_positions
+                ),
+                "max_concurrent_units": (
+                    result.max_concurrent_units
+                ),
+                "max_total_units": (
+                    max_total_units
+                ),
+                "max_direction_units": (
+                    max_direction_units
+                ),
+                "portfolio_model": (
+                    "CHRONOLOGICAL_OVERLAP_CONSERVATIVE_UNITS"
+                ),
+            }
+        )
+
+        for point in result.equity_curve:
+            equity_rows.append(
+                {
+                    "system": system_name,
+                    "event_date": (
+                        point.event_date
+                    ),
+                    "event_type": (
+                        point.event_type
+                    ),
+                    "ticker": (
+                        point.ticker
+                    ),
+                    "realized_equity": (
+                        point.realized_equity
+                    ),
+                    "peak_realized_equity": (
+                        point.peak_realized_equity
+                    ),
+                    "realized_drawdown_pct": (
+                        point.realized_drawdown_pct
+                    ),
+                    "active_positions": (
+                        point.active_positions
+                    ),
+                    "active_units": (
+                        point.active_units
+                    ),
+                    "active_long_units": (
+                        point.active_long_units
+                    ),
+                    "active_short_units": (
+                        point.active_short_units
+                    ),
+                    "portfolio_model": (
+                        "CHRONOLOGICAL_OVERLAP_CONSERVATIVE_UNITS"
+                    ),
+                }
+            )
+
+        for trade in result.accepted_trades:
+            accepted_rows.append(
+                {
+                    "ticker": trade.ticker,
+                    "system": trade.system,
+                    "side": trade.side,
+                    "entry_date": (
+                        trade.entry_date
+                    ),
+                    "exit_date": (
+                        trade.exit_date
+                    ),
+                    "shares_per_unit": (
+                        trade.shares_per_unit
+                    ),
+                    "units": trade.units,
+                    "total_shares": (
+                        trade.total_shares
+                    ),
+                    "entry_price": (
+                        trade.entry_price
+                    ),
+                    "exit_price": (
+                        trade.exit_price
+                    ),
+                    "initial_n": (
+                        trade.initial_n
+                    ),
+                    "risk_dollars_per_unit": (
+                        trade.risk_dollars_per_unit
+                    ),
+                    "pnl_dollars": (
+                        trade.pnl_dollars
+                    ),
+                    "realized_equity_at_entry": (
+                        trade.realized_equity_at_entry
+                    ),
+                    "realized_equity_before_exit": (
+                        trade.realized_equity_before_exit
+                    ),
+                    "realized_equity_after_exit": (
+                        trade.realized_equity_after_exit
+                    ),
+                    "exit_reason": (
+                        trade.exit_reason
+                    ),
+                }
+            )
+
+        for skip in result.skipped_trades:
+            skipped_rows.append(
+                {
+                    "ticker": skip.ticker,
+                    "system": skip.system,
+                    "side": skip.side,
+                    "entry_date": (
+                        skip.entry_date
+                    ),
+                    "exit_date": (
+                        skip.exit_date
+                    ),
+                    "requested_units": (
+                        skip.requested_units
+                    ),
+                    "reason": skip.reason,
+                }
+            )
+
+    return (
+        summary_rows,
+        equity_rows,
+        accepted_rows,
+        skipped_rows,
+    )
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -657,6 +919,16 @@ def main() -> None:
     ):
         raise ValueError(
             "--risk must be between 0 and 1"
+        )
+
+    if args.max_total_units < 1:
+        raise ValueError(
+            "--max-total-units must be at least 1"
+        )
+
+    if args.max_direction_units < 1:
+        raise ValueError(
+            "--max-direction-units must be at least 1"
         )
 
     systems = _systems_from_arg(
@@ -702,6 +974,12 @@ def main() -> None:
     )
     print(
         f"Risk / 1N unit:     {args.risk * 100:.2f}%"
+    )
+    print(
+        f"Max total units:    {args.max_total_units:,}"
+    )
+    print(
+        f"Max dir. units:     {args.max_direction_units:,}"
     )
     print()
 
@@ -1042,6 +1320,29 @@ def main() -> None:
         ),
     )
 
+    (
+        chronological_system_rows,
+        chronological_equity_rows,
+        chronological_trade_rows,
+        chronological_skip_rows,
+    ) = _build_chronological_rows(
+        dated_trades_by_system=(
+            dated_trades_by_system
+        ),
+        starting_equity=(
+            args.starting_equity
+        ),
+        risk_fraction=(
+            args.risk
+        ),
+        max_total_units=(
+            args.max_total_units
+        ),
+        max_direction_units=(
+            args.max_direction_units
+        ),
+    )
+
     report_dir = args.report_dir
 
     trades_path = (
@@ -1062,6 +1363,26 @@ def main() -> None:
     equity_path = (
         report_dir
         / "equity_curve.csv"
+    )
+
+    chronological_system_path = (
+        report_dir
+        / "chronological_system_comparison.csv"
+    )
+
+    chronological_equity_path = (
+        report_dir
+        / "chronological_equity_curve.csv"
+    )
+
+    chronological_trades_path = (
+        report_dir
+        / "chronological_portfolio_trades.csv"
+    )
+
+    chronological_skips_path = (
+        report_dir
+        / "chronological_portfolio_skips.csv"
     )
 
     trade_fields = (
@@ -1140,6 +1461,83 @@ def main() -> None:
         ),
     )
 
+    _write_csv(
+        chronological_system_path,
+        chronological_system_rows,
+        fieldnames=(
+            "system",
+            "candidates",
+            "accepted_trades",
+            "skipped_trades",
+            "starting_equity",
+            "ending_realized_equity",
+            "realized_return_pct",
+            "max_realized_drawdown_pct",
+            "max_concurrent_positions",
+            "max_concurrent_units",
+            "max_total_units",
+            "max_direction_units",
+            "portfolio_model",
+        ),
+    )
+
+    _write_csv(
+        chronological_equity_path,
+        chronological_equity_rows,
+        fieldnames=(
+            "system",
+            "event_date",
+            "event_type",
+            "ticker",
+            "realized_equity",
+            "peak_realized_equity",
+            "realized_drawdown_pct",
+            "active_positions",
+            "active_units",
+            "active_long_units",
+            "active_short_units",
+            "portfolio_model",
+        ),
+    )
+
+    _write_csv(
+        chronological_trades_path,
+        chronological_trade_rows,
+        fieldnames=(
+            "ticker",
+            "system",
+            "side",
+            "entry_date",
+            "exit_date",
+            "shares_per_unit",
+            "units",
+            "total_shares",
+            "entry_price",
+            "exit_price",
+            "initial_n",
+            "risk_dollars_per_unit",
+            "pnl_dollars",
+            "realized_equity_at_entry",
+            "realized_equity_before_exit",
+            "realized_equity_after_exit",
+            "exit_reason",
+        ),
+    )
+
+    _write_csv(
+        chronological_skips_path,
+        chronological_skip_rows,
+        fieldnames=(
+            "ticker",
+            "system",
+            "side",
+            "entry_date",
+            "exit_date",
+            "requested_units",
+            "reason",
+        ),
+    )
+
     print()
     print("=" * 78)
     print("TURTLE SANITY BACKTEST COMPLETE")
@@ -1199,6 +1597,55 @@ def main() -> None:
                 f"{float(row['max_drawdown_pct_proxy']):.2f}%"
             )
 
+        print()
+
+    print("Chronological overlapping portfolio:")
+    print(
+        "  NOTE: final trade units are conservatively reserved from initial "
+        "entry until exit because per-pyramid-add timestamps are not yet "
+        "stored in TurtleTrade."
+    )
+    print(
+        "  Drawdown below is realized-equity drawdown, not mark-to-market."
+    )
+    print()
+
+    for row in chronological_system_rows:
+        print(
+            f"{row['system']}:"
+        )
+        print(
+            "  Candidates:         "
+            f"{int(row['candidates']):,}"
+        )
+        print(
+            "  Accepted:           "
+            f"{int(row['accepted_trades']):,}"
+        )
+        print(
+            "  Skipped by limits:  "
+            f"{int(row['skipped_trades']):,}"
+        )
+        print(
+            "  Ending realized:    "
+            f"${float(row['ending_realized_equity']):,.2f}"
+        )
+        print(
+            "  Realized return:    "
+            f"{float(row['realized_return_pct']):+.2f}%"
+        )
+        print(
+            "  Realized max DD:    "
+            f"{float(row['max_realized_drawdown_pct']):.2f}%"
+        )
+        print(
+            "  Max positions:      "
+            f"{int(row['max_concurrent_positions']):,}"
+        )
+        print(
+            "  Max active units:   "
+            f"{int(row['max_concurrent_units']):,}"
+        )
         print()
 
     audit_path = (
@@ -1293,18 +1740,35 @@ def main() -> None:
         f"  {equity_path}"
     )
     print(
+        f"  {chronological_system_path}"
+    )
+    print(
+        f"  {chronological_equity_path}"
+    )
+    print(
+        f"  {chronological_trades_path}"
+    )
+    print(
+        f"  {chronological_skips_path}"
+    )
+    print(
         f"  {audit_path}"
     )
     print()
     print(
-        "IMPORTANT: the $5,000 equity result above is currently a "
-        "SEQUENTIAL PROXY. It does not yet model overlapping positions, "
-        "portfolio unit limits, sector/correlation limits, margin, "
-        "short borrow availability, commissions, or slippage."
+        "IMPORTANT: the legacy $5,000 SEQUENTIAL PROXY is retained only "
+        "for comparison. The CHRONOLOGICAL portfolio now models overlapping "
+        "positions and shared total/directional unit limits."
     )
     print(
-        "Use this run to validate trade mechanics and data integrity, "
-        "not as the final historical Turtle performance claim."
+        "It still conservatively reserves final trade units from initial "
+        "entry because per-add timestamps are not yet exposed by the "
+        "single-market simulator. It also does not yet model sector/correlation "
+        "groups, mark-to-market equity, margin, borrow, commissions, or slippage."
+    )
+    print(
+        "Use the chronological reports as the next portfolio research layer, "
+        "not yet as a final historical performance claim."
     )
     print()
 
