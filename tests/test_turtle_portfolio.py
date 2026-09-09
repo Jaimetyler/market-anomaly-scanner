@@ -571,3 +571,160 @@ def test_pnl_uses_only_actual_accepted_unit_fill_prices():
     assert result.ending_equity == pytest.approx(
         5375.0
     )
+
+
+
+def test_daily_mtm_curve_marks_open_long_position_to_close():
+    trade = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            side="LONG",
+            entry_date="2024-01-02",
+            exit_date="2024-01-04",
+            average_entry_price=100.0,
+            exit_price=105.0,
+            units=1,
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [trade],
+        config=TurtleChronologicalConfig(
+            starting_equity=5000.0,
+            risk_fraction_per_unit=0.01,
+        ),
+        mark_prices_by_ticker={
+            "AAA": {
+                "2024-01-02": 98.0,
+                "2024-01-03": 90.0,
+                "2024-01-04": 105.0,
+            }
+        },
+    )
+
+    points = {
+        point.session_date: point
+        for point in result.daily_mtm_curve
+    }
+
+    # 1N=$2, so $50 risk / $2 = 25 shares.
+    assert points["2024-01-02"].unrealized_pnl == pytest.approx(-50.0)
+    assert points["2024-01-02"].mtm_equity == pytest.approx(4950.0)
+
+    assert points["2024-01-03"].unrealized_pnl == pytest.approx(-250.0)
+    assert points["2024-01-03"].mtm_equity == pytest.approx(4750.0)
+    assert points["2024-01-03"].mtm_drawdown_pct == pytest.approx(-5.0)
+
+    # Exit is processed before the end-of-day mark, so open P&L is zero and
+    # the realized account contains the completed trade P&L.
+    assert points["2024-01-04"].unrealized_pnl == pytest.approx(0.0)
+    assert points["2024-01-04"].mtm_equity == pytest.approx(5125.0)
+
+    assert result.max_mtm_drawdown_pct == pytest.approx(-5.0)
+    assert result.worst_mtm_drawdown_date == "2024-01-03"
+
+
+def test_daily_mtm_curve_marks_short_position_correctly():
+    trade = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            side="SHORT",
+            entry_date="2024-01-02",
+            exit_date="2024-01-04",
+            average_entry_price=100.0,
+            exit_price=95.0,
+            units=1,
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [trade],
+        mark_prices_by_ticker={
+            "AAA": {
+                "2024-01-02": 102.0,
+                "2024-01-03": 110.0,
+                "2024-01-04": 95.0,
+            }
+        },
+    )
+
+    points = {
+        point.session_date: point
+        for point in result.daily_mtm_curve
+    }
+
+    assert points["2024-01-02"].unrealized_pnl == pytest.approx(-50.0)
+    assert points["2024-01-03"].unrealized_pnl == pytest.approx(-250.0)
+    assert points["2024-01-04"].unrealized_pnl == pytest.approx(0.0)
+
+
+def test_daily_mtm_uses_only_portfolio_accepted_units():
+    trade = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            side="LONG",
+            entry_date="2024-01-02",
+            exit_date="2024-01-05",
+            exit_price=104.0,
+            units=2,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=10,
+                    date="2024-01-02",
+                ),
+                _unit(
+                    price=101.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+            ),
+        ),
+    )
+
+    blocker = TurtleDatedTrade(
+        ticker="BBB",
+        trade=_trade(
+            side="LONG",
+            entry_index=11,
+            exit_index=30,
+            entry_date="2024-01-03",
+            exit_date="2024-01-10",
+            average_entry_price=50.0,
+            exit_price=50.0,
+            units=1,
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [trade, blocker],
+        config=TurtleChronologicalConfig(
+            max_total_units=2,
+            max_direction_units=12,
+        ),
+        mark_prices_by_ticker={
+            "AAA": {
+                "2024-01-02": 100.0,
+                "2024-01-03": 100.0,
+                "2024-01-04": 104.0,
+                "2024-01-05": 104.0,
+            },
+            "BBB": {
+                "2024-01-03": 50.0,
+                "2024-01-04": 50.0,
+                "2024-01-05": 50.0,
+                "2024-01-10": 50.0,
+            },
+        },
+    )
+
+    day = next(
+        point
+        for point in result.daily_mtm_curve
+        if point.session_date == "2024-01-04"
+    )
+
+    # AAA's second unit is rejected by the total-unit cap. MTM therefore
+    # includes only the accepted first unit: 25 shares * ($104-$100) = $100.
+    assert day.unrealized_pnl == pytest.approx(100.0)
+    assert day.active_units == 2

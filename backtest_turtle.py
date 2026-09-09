@@ -16,7 +16,7 @@ from scanner.corporate_actions import (
 )
 from scanner.flatfile_adjustments import adjust_flatfile_history_for_splits
 from scanner.flatfile_history import read_many_ticker_histories
-from scanner.turtle import SYSTEM_1, SYSTEM_2, TurtleSystem
+from scanner.turtle import SYSTEM_1, SYSTEM_2, TurtleSystem, bar_close
 from scanner.turtle_history import (
     audit_history_candidates,
     split_continuous_history,
@@ -676,7 +676,12 @@ def _build_chronological_rows(
     risk_fraction: float,
     max_total_units: int,
     max_direction_units: int,
+    mark_prices_by_ticker: dict[
+        str,
+        dict[str, float],
+    ],
 ) -> tuple[
+    list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -695,6 +700,10 @@ def _build_chronological_rows(
     ] = []
 
     skipped_rows: list[
+        dict[str, Any]
+    ] = []
+
+    mtm_rows: list[
         dict[str, Any]
     ] = []
 
@@ -740,6 +749,9 @@ def _build_chronological_rows(
                         ),
                     )
                 ),
+                mark_prices_by_ticker=(
+                    mark_prices_by_ticker
+                ),
             )
         )
 
@@ -777,6 +789,12 @@ def _build_chronological_rows(
                 ),
                 "max_realized_drawdown_pct": (
                     result.max_realized_drawdown_pct
+                ),
+                "max_mtm_drawdown_pct": (
+                    result.max_mtm_drawdown_pct
+                ),
+                "worst_mtm_drawdown_date": (
+                    result.worst_mtm_drawdown_date
                 ),
                 "max_concurrent_positions": (
                     result.max_concurrent_positions
@@ -832,6 +850,26 @@ def _build_chronological_rows(
                     ),
                     "portfolio_model": (
                         "CHRONOLOGICAL_ACTUAL_UNIT_TIMING"
+                    ),
+                }
+            )
+
+        for point in result.daily_mtm_curve:
+            mtm_rows.append(
+                {
+                    "system": system_name,
+                    "session_date": point.session_date,
+                    "realized_equity": point.realized_equity,
+                    "unrealized_pnl": point.unrealized_pnl,
+                    "mtm_equity": point.mtm_equity,
+                    "peak_mtm_equity": point.peak_mtm_equity,
+                    "mtm_drawdown_pct": point.mtm_drawdown_pct,
+                    "active_positions": point.active_positions,
+                    "active_units": point.active_units,
+                    "active_long_units": point.active_long_units,
+                    "active_short_units": point.active_short_units,
+                    "portfolio_model": (
+                        "CHRONOLOGICAL_ACTUAL_UNIT_TIMING_MTM"
                     ),
                 }
             )
@@ -909,6 +947,7 @@ def _build_chronological_rows(
         equity_rows,
         accepted_rows,
         skipped_rows,
+        mtm_rows,
     )
 
 
@@ -1025,6 +1064,11 @@ def main() -> None:
         dict[str, Any]
     ] = []
 
+    mark_prices_by_ticker: dict[
+        str,
+        dict[str, float],
+    ] = {}
+
     dated_trades_by_system: dict[
         str,
         list[
@@ -1067,6 +1111,16 @@ def main() -> None:
                     split_events,
                 )
             )
+
+            mark_prices_by_ticker[ticker] = {
+                session_date: float(
+                    bar_close(bar)
+                )
+                for bar in bars
+                if (
+                    session_date := _bar_date(bar)
+                )
+            }
 
             if len(bars) < 80:
                 too_short += 1
@@ -1338,6 +1392,7 @@ def main() -> None:
         chronological_equity_rows,
         chronological_trade_rows,
         chronological_skip_rows,
+        chronological_mtm_rows,
     ) = _build_chronological_rows(
         dated_trades_by_system=(
             dated_trades_by_system
@@ -1353,6 +1408,9 @@ def main() -> None:
         ),
         max_direction_units=(
             args.max_direction_units
+        ),
+        mark_prices_by_ticker=(
+            mark_prices_by_ticker
         ),
     )
 
@@ -1386,6 +1444,11 @@ def main() -> None:
     chronological_equity_path = (
         report_dir
         / "chronological_equity_curve.csv"
+    )
+
+    chronological_mtm_path = (
+        report_dir
+        / "chronological_mtm_equity_curve.csv"
     )
 
     chronological_trades_path = (
@@ -1489,6 +1552,8 @@ def main() -> None:
             "ending_realized_equity",
             "realized_return_pct",
             "max_realized_drawdown_pct",
+            "max_mtm_drawdown_pct",
+            "worst_mtm_drawdown_date",
             "max_concurrent_positions",
             "max_concurrent_units",
             "max_total_units",
@@ -1508,6 +1573,25 @@ def main() -> None:
             "realized_equity",
             "peak_realized_equity",
             "realized_drawdown_pct",
+            "active_positions",
+            "active_units",
+            "active_long_units",
+            "active_short_units",
+            "portfolio_model",
+        ),
+    )
+
+    _write_csv(
+        chronological_mtm_path,
+        chronological_mtm_rows,
+        fieldnames=(
+            "system",
+            "session_date",
+            "realized_equity",
+            "unrealized_pnl",
+            "mtm_equity",
+            "peak_mtm_equity",
+            "mtm_drawdown_pct",
             "active_positions",
             "active_units",
             "active_long_units",
@@ -1621,7 +1705,10 @@ def main() -> None:
         "pyramid-add execution dates from TurtleTrade."
     )
     print(
-        "  Drawdown below is realized-equity drawdown, not mark-to-market."
+        "  Daily MTM equity uses adjusted closes for open accepted units."
+    )
+    print(
+        "  Position sizing still uses realized equity; MTM is reporting-only."
     )
     print()
 
@@ -1664,6 +1751,14 @@ def main() -> None:
         print(
             "  Realized max DD:    "
             f"{float(row['max_realized_drawdown_pct']):.2f}%"
+        )
+        print(
+            "  MTM max DD:         "
+            f"{float(row['max_mtm_drawdown_pct']):.2f}%"
+        )
+        print(
+            "  Worst MTM DD date:  "
+            f"{row['worst_mtm_drawdown_date'] or 'N/A'}"
         )
         print(
             "  Max positions:      "
@@ -1773,6 +1868,9 @@ def main() -> None:
         f"  {chronological_equity_path}"
     )
     print(
+        f"  {chronological_mtm_path}"
+    )
+    print(
         f"  {chronological_trades_path}"
     )
     print(
@@ -1790,8 +1888,10 @@ def main() -> None:
     print(
         "The chronological model now consumes units on their actual simulator "
         "entry/add dates and computes P&L from the unit fills the portfolio "
-        "actually accepted. It still does not yet model sector/correlation "
-        "groups, daily mark-to-market equity, margin, borrow, commissions, or slippage."
+        "actually accepted. Daily mark-to-market equity is now reported "
+        "from adjusted closes, but position sizing still uses realized equity. "
+        "It still does not yet model sector/correlation groups, margin, borrow, "
+        "commissions, or slippage."
     )
     print(
         "Use the chronological reports as the next portfolio research layer, "

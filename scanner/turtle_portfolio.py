@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from scanner.turtle_simulation import TurtleTrade, TurtleUnit
 
@@ -146,16 +146,33 @@ class TurtleChronologicalEquityPoint:
 
 
 @dataclass(frozen=True)
+class TurtleDailyMtmPoint:
+    session_date: str
+    realized_equity: float
+    unrealized_pnl: float
+    mtm_equity: float
+    peak_mtm_equity: float
+    mtm_drawdown_pct: float
+    active_positions: int
+    active_units: int
+    active_long_units: int
+    active_short_units: int
+
+
+@dataclass(frozen=True)
 class TurtleChronologicalResult:
     starting_equity: float
     ending_equity: float
     total_pnl: float
     total_return_pct: float
     max_realized_drawdown_pct: float
+    max_mtm_drawdown_pct: float
+    worst_mtm_drawdown_date: str
 
     accepted_trades: tuple[TurtleChronologicalTrade, ...]
     skipped_trades: tuple[TurtlePortfolioSkip, ...]
     equity_curve: tuple[TurtleChronologicalEquityPoint, ...]
+    daily_mtm_curve: tuple[TurtleDailyMtmPoint, ...]
 
     max_concurrent_positions: int
     max_concurrent_units: int
@@ -420,6 +437,22 @@ def _position_pnl(
     )
 
 
+def _position_unrealized_pnl(
+    *,
+    position: _ActivePosition,
+    mark_price: float,
+) -> float:
+    return sum(
+        _trade_pnl(
+            side=position.trade.side,
+            entry_price=unit.entry_price,
+            exit_price=mark_price,
+            shares=position.shares_per_unit,
+        )
+        for unit in position.accepted_units
+    )
+
+
 def _active_unit_counts(
     active: Sequence[_ActivePosition],
 ) -> tuple[int, int, int]:
@@ -451,6 +484,10 @@ def run_chronological_turtle_portfolio(
     dated_trades: Sequence[TurtleDatedTrade],
     *,
     config: TurtleChronologicalConfig | None = None,
+    mark_prices_by_ticker: Mapping[
+        str,
+        Mapping[str, float],
+    ] | None = None,
 ) -> TurtleChronologicalResult:
     """
     Run one shared Turtle account through trades in calendar order.
@@ -474,8 +511,15 @@ def run_chronological_turtle_portfolio(
     single-market path assuming the rejected add had occurred, so continuing
     the chain would invent a path the portfolio never actually held.
 
+    Daily mark-to-market reporting:
+    - when mark_prices_by_ticker is supplied, end-of-day MTM equity is
+      calculated from each open accepted unit using that ticker's adjusted
+      daily close
+    - missing ticker closes carry the most recent known close forward
+    - position sizing still uses realized equity; MTM is reporting-only here
+
     Remaining limitations:
-    - realized-equity sizing/drawdown; no daily mark-to-market yet
+    - position sizing is still realized-equity based
     - no sector/correlation group limits yet
     - no margin, borrow, commissions, or slippage
     - daily OHLC cannot establish cross-market intraday event ordering
@@ -546,10 +590,20 @@ def run_chronological_turtle_portfolio(
                 )
             )
 
+    marks = mark_prices_by_ticker or {}
+
+    mark_dates: set[str] = set()
+    for ticker_marks in marks.values():
+        mark_dates.update(
+            str(session_date)
+            for session_date in ticker_marks
+        )
+
     all_dates = sorted(
         set(entries_by_date)
         | set(exits_by_date)
         | set(adds_by_date)
+        | mark_dates
     )
 
     realized_equity = config.starting_equity
@@ -564,6 +618,12 @@ def run_chronological_turtle_portfolio(
     accepted: list[TurtleChronologicalTrade] = []
     skipped: list[TurtlePortfolioSkip] = []
     curve: list[TurtleChronologicalEquityPoint] = []
+    daily_mtm_curve: list[TurtleDailyMtmPoint] = []
+
+    last_mark_by_ticker: dict[str, float] = {}
+    peak_mtm_equity = config.starting_equity
+    max_mtm_drawdown = 0.0
+    worst_mtm_drawdown_date = ""
 
     max_concurrent_positions = 0
     max_concurrent_units = 0
@@ -638,6 +698,84 @@ def run_chronological_turtle_portfolio(
             )
         )
 
+    def append_daily_mtm_point(
+        *,
+        session_date: str,
+    ) -> None:
+        nonlocal peak_mtm_equity
+        nonlocal max_mtm_drawdown
+        nonlocal worst_mtm_drawdown_date
+
+        active = list(
+            active_by_key.values()
+        )
+
+        (
+            total_units,
+            long_units,
+            short_units,
+        ) = _active_unit_counts(active)
+
+        unrealized_pnl = 0.0
+
+        for position in active:
+            ticker = position.ticker
+            mark_price = last_mark_by_ticker.get(
+                ticker
+            )
+
+            if mark_price is None:
+                # A newly-entered position should normally have a same-day
+                # close. If not, use its latest accepted fill until the first
+                # market close arrives rather than fabricating a zero mark.
+                if position.accepted_units:
+                    mark_price = (
+                        position.accepted_units[-1].entry_price
+                    )
+                else:
+                    continue
+
+            unrealized_pnl += (
+                _position_unrealized_pnl(
+                    position=position,
+                    mark_price=mark_price,
+                )
+            )
+
+        mtm_equity = max(
+            0.0,
+            realized_equity + unrealized_pnl,
+        )
+
+        peak_mtm_equity = max(
+            peak_mtm_equity,
+            mtm_equity,
+        )
+
+        mtm_drawdown = _drawdown_pct(
+            equity=mtm_equity,
+            peak_equity=peak_mtm_equity,
+        )
+
+        if mtm_drawdown < max_mtm_drawdown:
+            max_mtm_drawdown = mtm_drawdown
+            worst_mtm_drawdown_date = session_date
+
+        daily_mtm_curve.append(
+            TurtleDailyMtmPoint(
+                session_date=session_date,
+                realized_equity=realized_equity,
+                unrealized_pnl=unrealized_pnl,
+                mtm_equity=mtm_equity,
+                peak_mtm_equity=peak_mtm_equity,
+                mtm_drawdown_pct=mtm_drawdown,
+                active_positions=len(active),
+                active_units=total_units,
+                active_long_units=long_units,
+                active_short_units=short_units,
+            )
+        )
+
     def limit_reason(
         *,
         side: str,
@@ -676,6 +814,12 @@ def run_chronological_turtle_portfolio(
         return None
 
     for event_date in all_dates:
+        for ticker, ticker_marks in marks.items():
+            if event_date in ticker_marks:
+                last_mark_by_ticker[ticker] = float(
+                    ticker_marks[event_date]
+                )
+
         # --------------------------------------------------------------
         # 1. Exits
         # --------------------------------------------------------------
@@ -783,6 +927,9 @@ def run_chronological_turtle_portfolio(
             )
 
         if realized_equity <= 0:
+            append_daily_mtm_point(
+                session_date=event_date,
+            )
             break
 
         # --------------------------------------------------------------
@@ -1018,6 +1165,10 @@ def run_chronological_turtle_portfolio(
                 ticker=item.ticker,
             )
 
+        append_daily_mtm_point(
+            session_date=event_date,
+        )
+
     total_pnl = (
         realized_equity
         - config.starting_equity
@@ -1039,9 +1190,18 @@ def run_chronological_turtle_portfolio(
         max_realized_drawdown_pct=(
             max_realized_drawdown
         ),
+        max_mtm_drawdown_pct=(
+            max_mtm_drawdown
+        ),
+        worst_mtm_drawdown_date=(
+            worst_mtm_drawdown_date
+        ),
         accepted_trades=tuple(accepted),
         skipped_trades=tuple(skipped),
         equity_curve=tuple(curve),
+        daily_mtm_curve=tuple(
+            daily_mtm_curve
+        ),
         max_concurrent_positions=(
             max_concurrent_positions
         ),
