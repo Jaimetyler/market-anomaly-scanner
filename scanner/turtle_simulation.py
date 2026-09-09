@@ -22,6 +22,8 @@ from scanner.turtle import (
 class TurtleUnit:
     entry_price: float
     n: float
+    entry_index: int = -1
+    entry_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,10 @@ class TurtleTrade:
 
     bars_held: int
     ambiguous_bars: int
+
+    # Actual unit execution timeline. Item 0 is the initial entry;
+    # later items are 0.5N pyramid adds.
+    unit_entries: tuple[TurtleUnit, ...] = ()
 
 
 @dataclass
@@ -638,6 +644,8 @@ def _make_open_trade(
                     entry_price
                 ),
                 n=n,
+                entry_index=index,
+                entry_date=_date(bar),
             )
         ],
         stop_price=stop_price,
@@ -728,6 +736,9 @@ def _close_trade(
         ),
         ambiguous_bars=(
             trade.ambiguous_bars
+        ),
+        unit_entries=tuple(
+            trade.units
         ),
     )
 
@@ -1315,6 +1326,8 @@ def simulate_turtle_system(
                     TurtleUnit(
                         entry_price=fill,
                         n=unit_n,
+                        entry_index=index,
+                        entry_date=_date(bar),
                     )
                 )
 

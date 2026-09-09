@@ -10,6 +10,22 @@ from scanner.turtle_portfolio import (
     run_chronological_turtle_portfolio,
     unit_shares,
 )
+from scanner.turtle_simulation import TurtleUnit
+
+
+def _unit(
+    *,
+    price: float,
+    index: int,
+    date: str,
+    n: float = 2.0,
+) -> TurtleUnit:
+    return TurtleUnit(
+        entry_price=price,
+        n=n,
+        entry_index=index,
+        entry_date=date,
+    )
 
 
 def _trade(
@@ -25,7 +41,19 @@ def _trade(
     units: int = 1,
     initial_n: float = 2.0,
     exit_reason: str = "CHANNEL_EXIT",
+    unit_entries: tuple[TurtleUnit, ...] | None = None,
 ):
+    if unit_entries is None:
+        unit_entries = tuple(
+            _unit(
+                price=average_entry_price,
+                index=entry_index + offset,
+                date=entry_date,
+                n=initial_n,
+            )
+            for offset in range(units)
+        )
+
     return SimpleNamespace(
         system=system,
         side=side,
@@ -38,6 +66,7 @@ def _trade(
         units=units,
         initial_n=initial_n,
         exit_reason=exit_reason,
+        unit_entries=unit_entries,
     )
 
 
@@ -49,15 +78,69 @@ def test_unit_shares_uses_equity_risk_divided_by_n():
     ) == 25
 
 
+def test_actual_pyramid_adds_consume_units_on_their_real_dates():
+    trade = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            units=4,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=10,
+                    date="2024-01-02",
+                ),
+                _unit(
+                    price=101.0,
+                    index=11,
+                    date="2024-01-03",
+                ),
+                _unit(
+                    price=102.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+                _unit(
+                    price=103.0,
+                    index=13,
+                    date="2024-01-05",
+                ),
+            ),
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [trade],
+        config=TurtleChronologicalConfig(
+            max_total_units=12,
+            max_direction_units=12,
+        ),
+    )
+
+    events = [
+        (
+            point.event_date,
+            point.event_type,
+            point.active_units,
+        )
+        for point in result.equity_curve
+        if point.ticker == "AAA"
+    ]
+
+    assert events[:4] == [
+        ("2024-01-02", "ENTRY", 1),
+        ("2024-01-03", "ADD_2", 2),
+        ("2024-01-04", "ADD_3", 3),
+        ("2024-01-05", "ADD_4", 4),
+    ]
+
+
 def test_overlapping_positions_share_one_chronological_account():
     a = TurtleDatedTrade(
         ticker="AAA",
         trade=_trade(
             entry_date="2024-01-02",
             exit_date="2024-01-10",
-            average_entry_price=100.0,
             exit_price=110.0,
-            units=2,
         ),
     )
 
@@ -70,7 +153,6 @@ def test_overlapping_positions_share_one_chronological_account():
             exit_date="2024-01-11",
             average_entry_price=50.0,
             exit_price=55.0,
-            units=2,
         ),
     )
 
@@ -87,29 +169,37 @@ def test_overlapping_positions_share_one_chronological_account():
     assert len(result.accepted_trades) == 2
     assert not result.skipped_trades
     assert result.max_concurrent_positions == 2
-    assert result.max_concurrent_units == 4
+    assert result.max_concurrent_units == 2
 
-    # Both entries size from the same realized $5,000 because neither trade
-    # has exited yet: 1% of 5000 / N=2 = 25 shares per unit.
     assert all(
         trade.shares_per_unit == 25
         for trade in result.accepted_trades
     )
 
-    # AAA: 50 shares * $10 = $500
-    # BBB: 50 shares * $5 = $250
+    # AAA: 25 shares * $10 = $250
+    # BBB: 25 shares * $5 = $125
     assert result.ending_equity == pytest.approx(
-        5750.0
+        5375.0
     )
 
 
-def test_total_unit_limit_rejects_overlapping_candidate():
+def test_total_unit_limit_can_reject_an_add_without_rejecting_initial_trade():
     a = TurtleDatedTrade(
         ticker="AAA",
         trade=_trade(
-            units=4,
-            entry_date="2024-01-02",
-            exit_date="2024-01-10",
+            units=2,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=10,
+                    date="2024-01-02",
+                ),
+                _unit(
+                    price=101.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+            ),
         ),
     )
 
@@ -118,35 +208,103 @@ def test_total_unit_limit_rejects_overlapping_candidate():
         trade=_trade(
             entry_index=11,
             exit_index=21,
-            units=4,
             entry_date="2024-01-03",
             exit_date="2024-01-11",
+            units=1,
         ),
     )
 
     result = run_chronological_turtle_portfolio(
         [a, b],
         config=TurtleChronologicalConfig(
-            max_total_units=4,
+            max_total_units=2,
             max_direction_units=12,
         ),
     )
 
-    assert len(result.accepted_trades) == 1
-    assert len(result.skipped_trades) == 1
-    assert result.skipped_trades[0].ticker == "BBB"
-    assert (
-        result.skipped_trades[0].reason
-        == "TOTAL_UNIT_LIMIT"
+    assert len(result.accepted_trades) == 2
+
+    aaa = next(
+        trade
+        for trade in result.accepted_trades
+        if trade.ticker == "AAA"
+    )
+
+    assert aaa.units == 1
+    assert any(
+        skip.ticker == "AAA"
+        and skip.reason == "ADD_TOTAL_UNIT_LIMIT"
+        for skip in result.skipped_trades
     )
 
 
-def test_direction_unit_limit_rejects_same_side_exposure():
+def test_rejected_add_breaks_later_precomputed_add_chain():
+    a = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            units=3,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=10,
+                    date="2024-01-02",
+                ),
+                _unit(
+                    price=101.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+                _unit(
+                    price=102.0,
+                    index=13,
+                    date="2024-01-05",
+                ),
+            ),
+        ),
+    )
+
+    blocker = TurtleDatedTrade(
+        ticker="BBB",
+        trade=_trade(
+            entry_index=11,
+            exit_index=14,
+            entry_date="2024-01-03",
+            exit_date="2024-01-06",
+            units=1,
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [a, blocker],
+        config=TurtleChronologicalConfig(
+            max_total_units=2,
+            max_direction_units=12,
+        ),
+    )
+
+    aaa = next(
+        trade
+        for trade in result.accepted_trades
+        if trade.ticker == "AAA"
+    )
+
+    assert aaa.units == 1
+
+    aaa_reasons = [
+        skip.reason
+        for skip in result.skipped_trades
+        if skip.ticker == "AAA"
+    ]
+
+    assert "ADD_TOTAL_UNIT_LIMIT" in aaa_reasons
+    assert "ADD_CHAIN_BROKEN" in aaa_reasons
+
+
+def test_direction_unit_limit_rejects_same_side_initial_exposure():
     long_a = TurtleDatedTrade(
         ticker="AAA",
         trade=_trade(
             side="LONG",
-            units=4,
             entry_date="2024-01-02",
             exit_date="2024-01-10",
         ),
@@ -158,7 +316,6 @@ def test_direction_unit_limit_rejects_same_side_exposure():
             side="LONG",
             entry_index=11,
             exit_index=21,
-            units=4,
             entry_date="2024-01-03",
             exit_date="2024-01-11",
         ),
@@ -168,7 +325,7 @@ def test_direction_unit_limit_rejects_same_side_exposure():
         [long_a, long_b],
         config=TurtleChronologicalConfig(
             max_total_units=12,
-            max_direction_units=4,
+            max_direction_units=1,
         ),
     )
 
@@ -185,7 +342,6 @@ def test_opposite_directions_can_coexist_under_direction_cap():
         ticker="AAA",
         trade=_trade(
             side="LONG",
-            units=4,
             entry_date="2024-01-02",
             exit_date="2024-01-10",
         ),
@@ -197,7 +353,6 @@ def test_opposite_directions_can_coexist_under_direction_cap():
             side="SHORT",
             entry_index=11,
             exit_index=21,
-            units=4,
             entry_date="2024-01-03",
             exit_date="2024-01-11",
             average_entry_price=100.0,
@@ -208,21 +363,20 @@ def test_opposite_directions_can_coexist_under_direction_cap():
     result = run_chronological_turtle_portfolio(
         [long_trade, short_trade],
         config=TurtleChronologicalConfig(
-            max_total_units=8,
-            max_direction_units=4,
+            max_total_units=2,
+            max_direction_units=1,
         ),
     )
 
     assert len(result.accepted_trades) == 2
     assert not result.skipped_trades
-    assert result.max_concurrent_units == 8
+    assert result.max_concurrent_units == 2
 
 
 def test_same_day_exit_frees_units_before_new_entry():
     first = TurtleDatedTrade(
         ticker="AAA",
         trade=_trade(
-            units=4,
             entry_date="2024-01-02",
             exit_date="2024-01-10",
         ),
@@ -233,7 +387,6 @@ def test_same_day_exit_frees_units_before_new_entry():
         trade=_trade(
             entry_index=11,
             exit_index=21,
-            units=4,
             entry_date="2024-01-10",
             exit_date="2024-01-20",
         ),
@@ -242,8 +395,8 @@ def test_same_day_exit_frees_units_before_new_entry():
     result = run_chronological_turtle_portfolio(
         [first, replacement],
         config=TurtleChronologicalConfig(
-            max_total_units=4,
-            max_direction_units=4,
+            max_total_units=1,
+            max_direction_units=1,
         ),
     )
 
@@ -262,6 +415,62 @@ def test_same_day_exit_frees_units_before_new_entry():
     assert events_on_transition_day == [
         ("EXIT", "AAA"),
         ("ENTRY", "BBB"),
+    ]
+
+
+def test_same_day_exit_frees_capacity_before_existing_position_add():
+    exiting = TurtleDatedTrade(
+        ticker="AAA",
+        trade=_trade(
+            entry_date="2024-01-02",
+            exit_date="2024-01-04",
+        ),
+    )
+
+    pyramiding = TurtleDatedTrade(
+        ticker="BBB",
+        trade=_trade(
+            entry_index=11,
+            exit_index=30,
+            entry_date="2024-01-03",
+            exit_date="2024-01-20",
+            units=2,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=11,
+                    date="2024-01-03",
+                ),
+                _unit(
+                    price=101.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+            ),
+        ),
+    )
+
+    result = run_chronological_turtle_portfolio(
+        [exiting, pyramiding],
+        config=TurtleChronologicalConfig(
+            max_total_units=2,
+            max_direction_units=2,
+        ),
+    )
+
+    events = [
+        (
+            point.event_type,
+            point.ticker,
+            point.active_units,
+        )
+        for point in result.equity_curve
+        if point.event_date == "2024-01-04"
+    ]
+
+    assert events == [
+        ("EXIT", "AAA", 1),
+        ("ADD_2", "BBB", 2),
     ]
 
 
@@ -305,43 +514,60 @@ def test_later_entry_sizes_from_realized_equity_after_prior_exit():
         for trade in result.accepted_trades
     }
 
-    # First trade: 25 shares * $20 = +$500 -> realized equity $5,500.
+    # First trade: 25 shares * $20 = +$500 -> $5,500.
     assert (
         accepted_by_ticker["AAA"].realized_equity_after_exit
         == pytest.approx(5500.0)
     )
 
-    # Second unit size: 1% of $5,500 / $2 N = floor(27.5) = 27 shares.
     assert (
         accepted_by_ticker["BBB"].shares_per_unit
         == 27
     )
 
 
-def test_final_trade_units_are_reserved_from_initial_entry():
+def test_pnl_uses_only_actual_accepted_unit_fill_prices():
     a = TurtleDatedTrade(
         ticker="AAA",
         trade=_trade(
-            units=4,
-            entry_date="2024-01-02",
-            exit_date="2024-01-10",
+            exit_price=110.0,
+            units=2,
+            unit_entries=(
+                _unit(
+                    price=100.0,
+                    index=10,
+                    date="2024-01-02",
+                ),
+                _unit(
+                    price=105.0,
+                    index=12,
+                    date="2024-01-04",
+                ),
+            ),
         ),
     )
 
     result = run_chronological_turtle_portfolio(
         [a],
         config=TurtleChronologicalConfig(
-            max_total_units=12,
-            max_direction_units=12,
+            starting_equity=5000.0,
+            risk_fraction_per_unit=0.01,
+            max_total_units=2,
+            max_direction_units=2,
         ),
     )
 
-    entry_point = next(
-        point
-        for point in result.equity_curve
-        if point.event_type == "ENTRY"
-    )
+    accepted = result.accepted_trades[0]
 
-    # Until TurtleTrade exposes the date of each 0.5N add, the portfolio layer
-    # intentionally reserves the final completed trade unit count at entry.
-    assert entry_point.active_units == 4
+    # 25 shares per unit:
+    # first unit:  (110 - 100) * 25 = 250
+    # second unit: (110 - 105) * 25 = 125
+    assert accepted.pnl_dollars == pytest.approx(
+        375.0
+    )
+    assert accepted.entry_price == pytest.approx(
+        102.5
+    )
+    assert result.ending_equity == pytest.approx(
+        5375.0
+    )
