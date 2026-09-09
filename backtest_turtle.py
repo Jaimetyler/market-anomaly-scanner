@@ -4,7 +4,7 @@ import argparse
 import csv
 import math
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -750,7 +750,20 @@ def _build_chronological_rows(
                 "accepted_trades": len(
                     result.accepted_trades
                 ),
-                "skipped_trades": len(
+                "rejected_initial_entries": sum(
+                    1 for skip in result.skipped_trades
+                    if not skip.reason.startswith("ADD_")
+                ),
+                "rejected_pyramid_adds": sum(
+                    1 for skip in result.skipped_trades
+                    if skip.reason.startswith("ADD_")
+                    and skip.reason != "ADD_CHAIN_BROKEN"
+                ),
+                "broken_add_chain_events": sum(
+                    1 for skip in result.skipped_trades
+                    if skip.reason == "ADD_CHAIN_BROKEN"
+                ),
+                "total_skip_events": len(
                     result.skipped_trades
                 ),
                 "starting_equity": (
@@ -778,7 +791,7 @@ def _build_chronological_rows(
                     max_direction_units
                 ),
                 "portfolio_model": (
-                    "CHRONOLOGICAL_OVERLAP_CONSERVATIVE_UNITS"
+                    "CHRONOLOGICAL_ACTUAL_UNIT_TIMING"
                 ),
             }
         )
@@ -818,7 +831,7 @@ def _build_chronological_rows(
                         point.active_short_units
                     ),
                     "portfolio_model": (
-                        "CHRONOLOGICAL_OVERLAP_CONSERVATIVE_UNITS"
+                        "CHRONOLOGICAL_ACTUAL_UNIT_TIMING"
                     ),
                 }
             )
@@ -1468,7 +1481,10 @@ def main() -> None:
             "system",
             "candidates",
             "accepted_trades",
-            "skipped_trades",
+            "rejected_initial_entries",
+            "rejected_pyramid_adds",
+            "broken_add_chain_events",
+            "total_skip_events",
             "starting_equity",
             "ending_realized_equity",
             "realized_return_pct",
@@ -1601,9 +1617,8 @@ def main() -> None:
 
     print("Chronological overlapping portfolio:")
     print(
-        "  NOTE: final trade units are conservatively reserved from initial "
-        "entry until exit because per-pyramid-add timestamps are not yet "
-        "stored in TurtleTrade."
+        "  NOTE: portfolio capacity follows actual initial-entry and "
+        "pyramid-add execution dates from TurtleTrade."
     )
     print(
         "  Drawdown below is realized-equity drawdown, not mark-to-market."
@@ -1623,8 +1638,20 @@ def main() -> None:
             f"{int(row['accepted_trades']):,}"
         )
         print(
-            "  Skipped by limits:  "
-            f"{int(row['skipped_trades']):,}"
+            "  Rejected entries:   "
+            f"{int(row['rejected_initial_entries']):,}"
+        )
+        print(
+            "  Rejected adds:      "
+            f"{int(row['rejected_pyramid_adds']):,}"
+        )
+        print(
+            "  Broken add chains:  "
+            f"{int(row['broken_add_chain_events']):,}"
+        )
+        print(
+            "  Total skip events:  "
+            f"{int(row['total_skip_events']):,}"
         )
         print(
             "  Ending realized:    "
@@ -1761,10 +1788,10 @@ def main() -> None:
         "positions and shared total/directional unit limits."
     )
     print(
-        "It still conservatively reserves final trade units from initial "
-        "entry because per-add timestamps are not yet exposed by the "
-        "single-market simulator. It also does not yet model sector/correlation "
-        "groups, mark-to-market equity, margin, borrow, commissions, or slippage."
+        "The chronological model now consumes units on their actual simulator "
+        "entry/add dates and computes P&L from the unit fills the portfolio "
+        "actually accepted. It still does not yet model sector/correlation "
+        "groups, daily mark-to-market equity, margin, borrow, commissions, or slippage."
     )
     print(
         "Use the chronological reports as the next portfolio research layer, "
