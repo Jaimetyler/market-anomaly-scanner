@@ -15,7 +15,7 @@ from scanner.segmentation import (
 )
 
 
-DEFAULT_EVENTS = Path("data/research/master_anomalies_2019_2025.csv")
+DEFAULT_EVENTS = Path("data/research/master_anomalies_2019_2025_excursions.csv")
 DEFAULT_OUTPUT_DIR = Path("data/research/edge_reports")
 DEFAULT_HORIZONS: tuple[int, ...] = (1, 2, 3, 5, 10, 20)
 
@@ -55,10 +55,10 @@ def adapt_master_events(
     anchored from the next open after the first signal. We reuse those values
     rather than recomputing them from raw bars.
 
-    MFE/MAE are intentionally left NaN at each individual horizon because the
-    current master event schema stores event-level path extrema, not separate
-    path extrema for every 1/2/3/5/10/20-day window. We refuse to fabricate
-    horizon-specific values.
+    Horizon-specific MFE/MAE are supplied by the executable excursion
+    enrichment layer. They are anchored from the same next-open entry used by
+    executable forward returns, so each 1/2/3/5/10/20-day path measurement is
+    aligned with the research return convention.
     """
     horizons = tuple(sorted({int(h) for h in horizons}))
     if not horizons or horizons[0] <= 0:
@@ -76,6 +76,8 @@ def adapt_master_events(
         "entry_return_5d",
     ]
     required.extend(f"executable_return_{h}d" for h in horizons)
+    required.extend(f"contrarian_mfe_{h}d" for h in horizons)
+    required.extend(f"contrarian_mae_{h}d" for h in horizons)
     _require_columns(events, required)
 
     result = events.copy()
@@ -123,9 +125,18 @@ def adapt_master_events(
         result[f"contrarian_return_{suffix}"] = -raw_return
         result[f"reversed_{suffix}"] = raw_return.lt(0).astype("boolean")
 
-        # Do not misuse the event-wide extrema as horizon-specific extrema.
-        result[f"contrarian_mfe_{suffix}"] = np.nan
-        result[f"contrarian_mae_{suffix}"] = np.nan
+        # Horizon-specific executable path extrema. These are already
+        # expressed from the contrarian short perspective:
+        #   MFE > 0 is favorable
+        #   MAE < 0 is adverse
+        result[f"contrarian_mfe_{suffix}"] = _numeric(
+            result,
+            f"contrarian_mfe_{suffix}",
+        )
+        result[f"contrarian_mae_{suffix}"] = _numeric(
+            result,
+            f"contrarian_mae_{suffix}",
+        )
 
     return result
 

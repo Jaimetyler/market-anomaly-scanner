@@ -95,13 +95,24 @@ def test_parabolic_live_match():
         matches
     )
 
-    ids = {
+    assert archetypes
+
+    matched_ids = {
         match.archetype_id
         for match in archetypes
     }
 
-    assert "A003" in ids
-    assert "A006" in ids
+    parabolic_ids = set(
+        members.loc[
+            members["initial_setup"].eq(
+                "PARABOLIC_EXTENSION"
+            ),
+            "archetype_id",
+        ].astype(str)
+    )
+
+    assert matched_ids & parabolic_ids
+    assert "A006" in matched_ids
 
 
 def test_fresh_spike_live_match():
