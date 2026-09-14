@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -34,6 +35,9 @@ class _LivePosition:
     shares_per_unit: int
     risk_dollars_per_unit: float
     realized_equity_at_entry: float
+    entry_priority_seed: int
+    entry_priority_rank: int
+    entry_priority_token: str
 
     @property
     def units(self) -> int:
@@ -47,6 +51,42 @@ class _LivePosition:
     def accepted_units(self):
         return self.state.accepted_units
 
+
+def _priority_token(
+    *,
+    seed: int,
+    key: tuple[str, int],
+    action: TurtleStateAction,
+) -> str:
+    """Stable neutral priority without using post-fill market information."""
+    payload = "|".join(
+        (
+            str(seed),
+            action.session_date,
+            action.action_type,
+            action.system,
+            action.side,
+            key[0],
+            str(key[1]),
+        )
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _rank_proposals(
+    proposals: Sequence[tuple[tuple[str, int], TurtleStateAction]],
+    *,
+    seed: int,
+) -> list[tuple[tuple[str, int], TurtleStateAction, int, str]]:
+    decorated = [
+        (key, action, _priority_token(seed=seed, key=key, action=action))
+        for key, action in proposals
+    ]
+    decorated.sort(key=lambda item: (item[2], item[0][0], item[0][1]))
+    return [
+        (key, action, rank, token)
+        for rank, (key, action, token) in enumerate(decorated, start=1)
+    ]
 
 def _bar_date(bar: Any) -> str:
     if isinstance(bar, dict):
@@ -255,6 +295,9 @@ def run_stateful_turtle_portfolio(
                 realized_equity_before_exit=equity_before_exit,
                 realized_equity_after_exit=realized_equity,
                 exit_reason=closed_trade.exit_reason,
+                entry_priority_seed=position.entry_priority_seed,
+                entry_priority_rank=position.entry_priority_rank,
+                entry_priority_token=position.entry_priority_token,
             )
         )
         append_curve(
@@ -355,12 +398,12 @@ def run_stateful_turtle_portfolio(
             break
 
         # 2. Adds. Multiple levels may execute on the same bar.
-        for key, first_action in sorted(
-            (
+        for key, first_action, priority_rank, priority_token in _rank_proposals(
+            [
                 item for item in proposals
                 if item[1].action_type == "ADD"
-            ),
-            key=lambda item: (item[0][0], item[0][1]),
+            ],
+            seed=config.entry_priority_seed,
         ):
             if key not in active:
                 continue
@@ -383,6 +426,9 @@ def run_stateful_turtle_portfolio(
                             exit_date="",
                             requested_units=1,
                             reason="TRADE_UNIT_LIMIT",
+                            priority_seed=config.entry_priority_seed,
+                            priority_rank=priority_rank,
+                            priority_token=priority_token,
                         )
                     )
                     state.reject(action)
@@ -403,6 +449,9 @@ def run_stateful_turtle_portfolio(
                             exit_date="",
                             requested_units=1,
                             reason=f"ADD_{reason}",
+                            priority_seed=config.entry_priority_seed,
+                            priority_rank=priority_rank,
+                            priority_token=priority_token,
                         )
                     )
                     state.reject(action)
@@ -417,12 +466,12 @@ def run_stateful_turtle_portfolio(
                 action = state.propose_current_add(action.bar_index)
 
         # 3. New entries.
-        for key, action in sorted(
-            (
+        for key, action, priority_rank, priority_token in _rank_proposals(
+            [
                 item for item in proposals
                 if item[1].action_type == "ENTRY"
-            ),
-            key=lambda item: (item[0][0], item[0][1]),
+            ],
+            seed=config.entry_priority_seed,
         ):
             state = states[key]
 
@@ -441,6 +490,9 @@ def run_stateful_turtle_portfolio(
                         exit_date="",
                         requested_units=1,
                         reason="UNIT_SIZE_BELOW_ONE_SHARE",
+                        priority_seed=config.entry_priority_seed,
+                        priority_rank=priority_rank,
+                        priority_token=priority_token,
                     )
                 )
                 state.reject(action)
@@ -457,6 +509,9 @@ def run_stateful_turtle_portfolio(
                         exit_date="",
                         requested_units=1,
                         reason=reason,
+                        priority_seed=config.entry_priority_seed,
+                        priority_rank=priority_rank,
+                        priority_token=priority_token,
                     )
                 )
                 state.reject(action)
@@ -471,6 +526,9 @@ def run_stateful_turtle_portfolio(
                 shares_per_unit=shares_per_unit,
                 risk_dollars_per_unit=risk_dollars,
                 realized_equity_at_entry=realized_equity,
+                entry_priority_seed=config.entry_priority_seed,
+                entry_priority_rank=priority_rank,
+                entry_priority_token=priority_token,
             )
             append_curve(
                 session_date=session_date,

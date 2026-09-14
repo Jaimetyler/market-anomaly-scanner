@@ -92,6 +92,9 @@ class TurtleChronologicalConfig:
     # Correlated-market group caps come next.
     max_total_units: int = 12
     max_direction_units: int = 12
+    # Neutral, reproducible ordering for same-session stateful proposals.
+    # Ticker names are used only as a final collision tie-breaker.
+    entry_priority_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,9 @@ class TurtleChronologicalTrade:
     realized_equity_after_exit: float
 
     exit_reason: str
+    entry_priority_seed: int = 0
+    entry_priority_rank: int = 0
+    entry_priority_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,9 @@ class TurtlePortfolioSkip:
     exit_date: str
     requested_units: int
     reason: str
+    priority_seed: int = 0
+    priority_rank: int = 0
+    priority_token: str = ""
 
 
 @dataclass(frozen=True)
