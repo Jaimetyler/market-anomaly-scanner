@@ -1,6 +1,8 @@
 """Small command line catalog of published strategy reference calculations."""
 
 import argparse
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 
 STRATEGIES = {
@@ -17,11 +19,26 @@ def main(argv=None):
     run.add_argument("strategy", choices=STRATEGIES)
     run.add_argument("input_csv", help="monthly input CSV")
     run.add_argument("output_csv", help="result CSV")
+    signals = commands.add_parser("signals", help="current monthly ETF proxy targets and paper sizing")
+    signals.add_argument("strategy", choices=["faber-gtaa5"])
+    signals.add_argument("--as-of", type=date.fromisoformat,
+                         default=datetime.now(ZoneInfo("America/New_York")).date())
+    signals.add_argument("--equity", type=float, default=100_000)
+    signals.add_argument("--output-dir", default="data/research/faber_current_signals")
+    signals.add_argument("--input-csv", help="offline monthly input; requires latest completed month")
+    signals.add_argument("--holdings-csv", help="optional ticker,shares CSV for paper rebalance actions")
     args = parser.parse_args(argv)
     if args.command == "list":
         for name, (description, _) in STRATEGIES.items():
             print(f"{name}: {description}")
         print("Turtle: experimental stock adaptation, outside the published catalog")
+        return
+    if args.command == "signals":
+        from scanner.gtaa_signals import run_signals
+        try:
+            run_signals(args.as_of, args.output_dir, args.equity, args.input_csv, args.holdings_csv)
+        except (ValueError, KeyError, IndexError, TypeError, OSError) as error:
+            parser.exit(2, f"Signals unavailable: {error}\n")
         return
     # Import only the selected calculation. Both modules retain their original
     # independent interfaces and validation; no rules are changed here.
