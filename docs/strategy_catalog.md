@@ -32,3 +32,12 @@ python -m scanner.paper_cli status
 
 Price fetching, later-session simulated fills, marks, and income entries are
 documented in `docs/faber_paper_ledger.md`.
+
+Daily paper cycle and local dashboard:
+
+```bash
+python -m scanner.paper_daily
+```
+
+See `docs/faber_daily_runner.md` for waiting states, monthly sequencing, and
+report paths. This command does not install a scheduler.
