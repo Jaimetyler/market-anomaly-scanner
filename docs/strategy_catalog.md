@@ -21,3 +21,14 @@ python -m scanner.strategy_cli signals faber-gtaa5 --equity 100000
 This separate command fetches data and creates a report; it never submits
 orders. Monthly confirmation, holdings input, and offline use are documented
 in `docs/faber_current_signals.md`.
+
+Local paper account commands (SQLite ledger, no broker connection):
+
+```bash
+python -m scanner.paper_cli init --equity 100000
+python -m scanner.paper_cli plan
+python -m scanner.paper_cli status
+```
+
+Price fetching, later-session simulated fills, marks, and income entries are
+documented in `docs/faber_paper_ledger.md`.
