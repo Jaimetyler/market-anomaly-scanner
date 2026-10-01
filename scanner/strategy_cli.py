@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 STRATEGIES = {
     "faber-10month": ("Single-asset 10-month moving average", "scanner.published_faber"),
     "faber-gtaa5": ("Five-asset GTAA, equal 20% sleeves", "scanner.published_faber_gtaa"),
+    "gem": ("Antonacci GEM, 12-month absolute then relative momentum", "scanner.published_gem"),
 }
 
 
@@ -44,8 +45,10 @@ def main(argv=None):
     # independent interfaces and validation; no rules are changed here.
     if args.strategy == "faber-10month":
         from scanner.published_faber import main as calculate
-    else:
+    elif args.strategy == "faber-gtaa5":
         from scanner.published_faber_gtaa import main as calculate
+    else:
+        from scanner.published_gem import main as calculate
     calculate(args.input_csv, args.output_csv)
     print(f"Wrote {args.output_csv}")
 
