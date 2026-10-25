@@ -43,6 +43,9 @@ jobs:
           git rev-parse HEAD > audit-artifacts/commit.txt
           sha256sum requirements.txt > audit-artifacts/requirements.sha256
       - name: Run regression tests
+        env:
+          # Offline regression suite uses mocked provider calls; never use a live key here.
+          MASSIVE_API_KEY: offline-test-placeholder
         shell: bash
         run: |
           set -o pipefail
