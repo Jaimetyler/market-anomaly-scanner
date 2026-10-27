@@ -1,0 +1,79 @@
+name: Research baseline audit
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scanner/**"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/research-baseline.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scanner/**"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/research-baseline.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Record environment
+        run: |
+          mkdir -p audit-artifacts
+          python --version > audit-artifacts/environment.txt
+          python -m pip freeze >> audit-artifacts/environment.txt
+          git rev-parse HEAD > audit-artifacts/commit.txt
+          sha256sum requirements.txt > audit-artifacts/requirements.sha256
+      - name: Run portable regression tests
+        env:
+          # Offline regression suite uses mocked provider calls; never use a live key here.
+          MASSIVE_API_KEY: offline-test-placeholder
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -q --disable-warnings --maxfail=1 -k "not test_parabolic_live_match and not test_fresh_spike_live_match and not test_best_match_per_archetype_collapses_duplicates" --junitxml=audit-artifacts/pytest-results.xml 2>&1 | tee audit-artifacts/pytest-output.txt
+      - name: Verify historical research fixture provenance
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          fixture = Path("data/research/consolidation_reports/archetype_members.csv")
+          report = {"fixture": str(fixture), "present": fixture.is_file(), "status": "available" if fixture.is_file() else "missing"}
+          if fixture.is_file():
+              raw = fixture.read_bytes()
+              report.update(size_bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(), header=raw.splitlines()[0].decode("utf-8-sig", errors="replace") if raw else "")
+          Path("audit-artifacts/historical-fixture.json").write_text(json.dumps(report, indent=2) + "\\n")
+          print(json.dumps(report))
+          PY
+      - name: Record missing historical fixture limitation
+        if: always()
+        run: |
+          echo "Excluded 3 historical-archetype integration tests requiring ignored data/research/consolidation_reports/archetype_members.csv." > audit-artifacts/limitations.txt
+          echo "These tests remain in the suite and must be reproduced separately before commercial release." >> audit-artifacts/limitations.txt
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-baseline-${{ github.sha }}
+          path: audit-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
