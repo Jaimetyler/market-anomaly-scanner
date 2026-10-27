@@ -50,6 +50,20 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/ -q --disable-warnings --maxfail=1 -k "not test_parabolic_live_match and not test_fresh_spike_live_match and not test_best_match_per_archetype_collapses_duplicates" --junitxml=audit-artifacts/pytest-results.xml 2>&1 | tee audit-artifacts/pytest-output.txt
+      - name: Verify historical research fixture provenance
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          fixture = Path("data/research/consolidation_reports/archetype_members.csv")
+          report = {"fixture": str(fixture), "present": fixture.is_file(), "status": "available" if fixture.is_file() else "missing"}
+          if fixture.is_file():
+              raw = fixture.read_bytes()
+              report.update(size_bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(), header=raw.splitlines()[0].decode("utf-8-sig", errors="replace") if raw else "")
+          Path("audit-artifacts/historical-fixture.json").write_text(json.dumps(report, indent=2) + "\\n")
+          print(json.dumps(report))
+          PY
       - name: Record missing historical fixture limitation
         if: always()
         run: |
