@@ -136,6 +136,7 @@ def simulate(
     slip = slippage_bps / 10_000
     for day in sorted(by_date):
         today = by_date[day]
+        opening_cash = cash
         # Missing a bar while a position is open is a data-integrity failure,
         # not permission to use a future close or silently skip a session.
         for ticker in positions:
@@ -162,10 +163,9 @@ def simulate(
                 pnl = shares * (exit_px - pos["entry_px"] - 2 * commission_per_share)
                 trades.append(Trade(ticker, pos["entry_date"], day, shares, pos["entry_px"], exit_px, pnl, reason))
                 del positions[ticker]
-        # Same-day exit proceeds were not known at the open. Do not recycle
-        # capital from intraday stop or close-based exits into morning entries.
-        # (Conservative: reserve starting-day cash for new positions.)
+        # Do not recycle proceeds from intraday or close exits into morning entries.
         # Deterministic ordering, no overlapping positions in the same ticker.
+        entry_budget = opening_cash
         for s in sorted(entry_map.get(day, []), key=lambda x: (x.ticker, x.signal_date)):
             if len(positions) >= max_positions or s.ticker in positions:
                 continue
@@ -179,11 +179,13 @@ def simulate(
             )
             shares = min(
                 floor(equity * risk_fraction / risk_per_share),
-                floor(cash / (px + commission_per_share)),
+                floor(entry_budget / (px + commission_per_share)),
             )
             if shares < 1:
                 continue
-            cash -= shares * (px + commission_per_share)
+            entry_cost = shares * (px + commission_per_share)
+            cash -= entry_cost
+            entry_budget -= entry_cost
             positions[s.ticker] = dict(
                 shares=shares, stop=s.stop, entry_px=px,
                 entry_date=day, entry_idx=indices[s.ticker][day],
