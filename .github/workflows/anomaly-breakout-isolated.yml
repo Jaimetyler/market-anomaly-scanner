@@ -1,0 +1,17 @@
+name: Anomaly breakout isolated tests
+on:
+  push:
+    branches: [research/anomaly-breakout-ab-20261029]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  synthetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_anomaly_breakout_engine.py
