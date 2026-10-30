@@ -136,6 +136,11 @@ def simulate(
     slip = slippage_bps / 10_000
     for day in sorted(by_date):
         today = by_date[day]
+        # Missing a bar while a position is open is a data-integrity failure,
+        # not permission to use a future close or silently skip a session.
+        for ticker in positions:
+            if ticker not in today:
+                raise ValueError(f"Missing held-position bar {ticker} on {day}")
         # Existing positions: check open-gap and intraday stops before time exit.
         for ticker, pos in list(positions.items()):
             b = today.get(ticker)
@@ -157,6 +162,9 @@ def simulate(
                 pnl = shares * (exit_px - pos["entry_px"] - 2 * commission_per_share)
                 trades.append(Trade(ticker, pos["entry_date"], day, shares, pos["entry_px"], exit_px, pnl, reason))
                 del positions[ticker]
+        # Same-day exit proceeds were not known at the open. Do not recycle
+        # capital from intraday stop or close-based exits into morning entries.
+        # (Conservative: reserve starting-day cash for new positions.)
         # Deterministic ordering, no overlapping positions in the same ticker.
         for s in sorted(entry_map.get(day, []), key=lambda x: (x.ticker, x.signal_date)):
             if len(positions) >= max_positions or s.ticker in positions:
