@@ -2,6 +2,8 @@ name: Anomaly breakout isolated tests
 on:
   push:
     branches: [research/anomaly-breakout-ab-20261029]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 jobs:
   synthetic:
