@@ -15,10 +15,11 @@ from experiments.anomaly_breakout.local_adapter import raw_development_smoke
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--observations", default="data/research/maturity_rebuild_v1/master_observations_2019_2025.csv")
+    p.add_argument("--flatfiles-root", default=None, help="Existing local day_aggs directory")
     p.add_argument("--tickers", nargs="+", required=True, help="Exact case-sensitive tickers")
     p.add_argument("--output", default="data/research/anomaly_breakout/raw_development_diagnostic.csv")
     args = p.parse_args()
-    signals = raw_development_smoke(args.observations, tickers=args.tickers)
+    signals = raw_development_smoke(args.observations, tickers=args.tickers, root=args.flatfiles_root)
     target = Path(args.output)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", newline="", encoding="utf-8") as handle:
