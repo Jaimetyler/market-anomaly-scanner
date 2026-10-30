@@ -23,7 +23,7 @@ def test_next_open_and_no_lookahead():
 
 def test_gap_stop_is_worse_than_stop():
     bars = [
-        Bar("2020-01-01", 100, 105, 95, 100, 100),
+        Bar("2020-01-01", 100, 105, 96, 100, 100),
         Bar("2020-01-02", 90, 92, 85, 88, 100),
     ]
     signal = Signal("XYZ", "2019-12-31", "2020-01-01", 95, True)
@@ -36,7 +36,7 @@ def test_gap_stop_is_worse_than_stop():
 
 def test_filter_and_cash_constraint():
     bars = [
-        Bar("2020-01-01", 100, 101, 99, 100, 100),
+        Bar("2020-01-01", 100, 101, 100, 100, 100),
         Bar("2020-01-02", 101, 102, 100, 101, 100),
     ]
     s = Signal("XYZ", "2019-12-31", "2020-01-01", 99, False)
