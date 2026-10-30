@@ -5,8 +5,8 @@ import pytest
 def test_next_open_and_no_lookahead():
     bars = []
     for i in range(22):
-        high = 20 if i < 10 else 12
-        low = 5 if i < 10 else 9
+        high = 18 if i < 15 else 12
+        low = 6 if i < 15 else 9
         close = 10
         volume = 100
         if i == 20:
@@ -15,7 +15,7 @@ def test_next_open_and_no_lookahead():
     # Last bar is a future entry. Its high/close must not change the signal.
     bars[-1] = Bar("2020-01-22", 24, 100, 1, 100, 100)
     # Fix artificial high/low validity on the future bar.
-    signals = detect_signals("XYZ", bars, {"2020-01-18"}, {"2020-01-21": True})
+    signals = detect_signals("XYZ", bars, {"2020-01-19"}, {"2020-01-21": True})
     assert len(signals) == 1
     assert signals[0].entry_date == "2020-01-22"
     assert signals[0].anomaly is True
