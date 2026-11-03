@@ -15,6 +15,7 @@ DEVELOPMENT_END = "2023-12-31"
 def read_anomaly_dates(
     path: str | Path, *, tickers: list[str] | None = None,
     lineage_aware: bool = False,
+    identity_errors: dict[str, str] | None = None,
 ) -> dict[str, set[str]]:
     """Eligible observations only. Exact case-sensitive provider ticker retained.
 
@@ -42,8 +43,11 @@ def read_anomaly_dates(
             if row["research_eligible"].strip().lower() == "true" and row["ca_excluded"].strip().lower() != "true":
                 dates[ticker].add(day)
     ambiguous = sorted(key for key, ids in identities.items() if len(ids) != 1 or "" in ids)
-    if ambiguous:
+    if ambiguous and identity_errors is None:
         raise ValueError(f"Ticker identity ambiguity (sample): {ambiguous[:20]}")
+    for ticker, segment in ambiguous:
+        identity_errors[ticker] = f"Ambiguous or blank observation identity in lineage segment {segment}"
+        dates.pop(ticker, None)
     return dict(dates)
 
 

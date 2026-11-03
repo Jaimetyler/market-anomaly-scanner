@@ -139,3 +139,29 @@ This is a descriptive check of the selected ticker sample. Security mapping and
 legacy corporate-action completeness remain unverified. It cannot establish an
 anomaly advantage, annual performance or the feasibility of taking overlapping
 signals under cash/risk constraints.
+
+### Broader fixed development sample
+
+```bash
+git pull --ff-only && python -m experiments.anomaly_breakout.run_local --universe-sample 250
+```
+
+This chooses up to 250 stocks by a fixed SHA-256 rank (seed 20261029) from the
+union of eligible symbols in valid 2019–2023 universe snapshots. Selection does
+not inspect anomalies, prices or trade outcomes; it does not require a stock to
+survive until the final date. Actual candidate eligibility remains an exact-date
+snapshot check. The selected list, union fingerprint, method and seed are recorded.
+This is a broader sample, not a complete full-market test. `--tickers` and
+`--universe-sample` are mutually exclusive; sample size is bounded at 250.
+
+The run remains offline by default. Missing split caches and identity conflicts
+are counted as exclusions/partial coverage, without substituting other stocks
+into the fixed sample. Symbols without anomaly observations stay in the baseline.
+An ambiguous observation identity excludes the affected symbol from both groups
+while other symbols continue; the standalone anomaly loader still raises on
+ambiguities unless a rejection-report dictionary is explicitly supplied.
+
+No new API fetches are needed for the command above. The existing optional
+missing-cache fetch remains bounded at 20 symbols, so a large missing-cache list
+is reported rather than triggering an unbounded retrieval. Price fingerprints
+are streamed without constructing a second full copy of all bar dictionaries.

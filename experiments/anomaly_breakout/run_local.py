@@ -36,6 +36,42 @@ DEFAULT_TICKERS = ["A", "AA", "AAL", "AAC", "AAN"]
 OBSERVATIONS = Path("research/maturity_rebuild_v1/master_observations_2019_2025.csv")
 
 
+def select_universe_sample(root: Path, size: int):
+    """Selection depends only on valid historical listings, never anomaly rows."""
+    report, _ = universe_review(root / "historical_universe", set(), [], include_symbols=True)
+    symbols = [t for t in report.pop("eligible_symbols") if t != "SPY" and
+               not any(c in t for c in "/\\\0")]
+    if not symbols:
+        raise ValueError("No usable development universe snapshots available for sampling")
+    if not 1 <= size <= 250:
+        raise ValueError("Universe sample size must be between 1 and 250")
+    seed = 20261029
+    ranked = sorted(symbols, key=lambda t: hashlib.sha256(f"{seed}:{t}".encode()).digest())
+    selected = sorted(ranked[:size])
+    return selected, {"method": "fixed_hash_rank_from_development_listing_union",
+                      "seed": seed, "requested": size, "selected": len(selected),
+                      "source_symbols": len(symbols), "usable_snapshots": report["usable_snapshots"],
+                      "source_symbols_sha256": hashlib.sha256(json.dumps(symbols).encode()).hexdigest(),
+                      "not_conditioned_on_anomalies_or_outcomes": True}
+
+
+def bars_digest(histories):
+    """Same canonical JSON fingerprint as before, without a second full copy."""
+    hasher = hashlib.sha256()
+    hasher.update(b"{")
+    for ti, (ticker, bars) in enumerate(sorted(histories.items())):
+        if ti:
+            hasher.update(b", ")
+        hasher.update((json.dumps(ticker) + ": [").encode())
+        for bi, bar in enumerate(bars):
+            if bi:
+                hasher.update(b", ")
+            hasher.update(json.dumps(asdict(bar), sort_keys=True, allow_nan=True).encode())
+        hasher.update(b"]")
+    hasher.update(b"}")
+    return hasher.hexdigest()
+
+
 def fetch_missing_splits(root: Path, tickers: list[str], progress=print):
     """Explicit opt-in: use main scanner credentials and its bounded client.
 
@@ -206,7 +242,7 @@ def price_review(bars, spy_dates):
             "missing_vs_spy_within_observed_span": len(missing), "missing_sample": missing[:20]}
 
 
-def universe_review(root: Path, expected_days: set[str], tickers: list[str]):
+def universe_review(root: Path, expected_days: set[str], tickers: list[str], *, include_symbols=False):
     """Inspect exact-date snapshots; never fill gaps with a future snapshot."""
     inventory, membership, union = [], {}, set()
     for path in sorted(root.glob("*.json")):
@@ -252,12 +288,15 @@ def universe_review(root: Path, expected_days: set[str], tickers: list[str]):
             evidence["reason"] = str(error)
         inventory.append(evidence)
     missing = sorted(expected_days - set(membership))
-    return {"snapshots": len(inventory), "usable_snapshots": len(membership),
+    report = {"snapshots": len(inventory), "usable_snapshots": len(membership),
             "expected_spy_development_sessions": len(expected_days),
             "missing_sessions": len(missing), "missing_sample": missing[:25],
             "distinct_eligible_symbols": len(union),
             "coverage": "Legacy snapshots do not certify pagination or security lineage",
-            "inventory": inventory}, membership
+            "inventory": inventory}
+    if include_symbols:
+        report["eligible_symbols"] = sorted(union)
+    return report, membership
 
 
 def membership_status(membership, day, ticker):
@@ -281,8 +320,9 @@ def run(root: Path, tickers: list[str], progress=print):
                            "Missing-session and delisting/terminal-value policy require review",
                            "No portfolio comparison or profitability claim in this report"]}
     progress("Reading eligible anomaly dates (2019-2023 only)...", flush=True)
+    identity_errors = {}
     try:
-        anomalies = read_anomaly_dates(observations, tickers=tickers, lineage_aware=True)
+        anomalies = read_anomaly_dates(observations, tickers=tickers, lineage_aware=True, identity_errors=identity_errors)
     except (OSError, ValueError, TypeError) as error:
         report["observation_error"] = str(error)
         report["status"] = "BLOCKED"
@@ -293,9 +333,8 @@ def run(root: Path, tickers: list[str], progress=print):
     spy_dates = {b.session_date for b in spy}
     report["prices"] = {t: price_review(histories.get(t, []), spy_dates) for t in [*tickers, "SPY"]}
     # Fingerprint the exact selected bars, not the multi-hundred-MB archives.
-    report["selected_bars_sha256"] = hashlib.sha256(json.dumps(
-        {t: [asdict(b) for b in bars] for t, bars in sorted(histories.items())},
-        sort_keys=True, allow_nan=True).encode()).hexdigest()
+    report["selected_bars_sha256"] = bars_digest(histories)
+    report["excluded_observation_identities"] = identity_errors
     progress("Checking split caches and exact-date universe snapshots...", flush=True)
     caches, evidence = {}, {}
     for ticker in [*tickers, "SPY"]:
@@ -322,6 +361,9 @@ def run(root: Path, tickers: list[str], progress=print):
             report["signal_errors"][basis] = str(error)
             continue
         for ticker in tickers:
+            if ticker in identity_errors:
+                report["signal_errors"][f"{basis}:{ticker}"] = identity_errors[ticker]
+                continue
             bars = histories.get(ticker, [])
             if len(bars) < 22:
                 report["signal_errors"][f"{basis}:{ticker}"] = "Insufficient price history"
@@ -379,11 +421,16 @@ def write_bundle(report, rows, output: Path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, help="Main scanner data folder; auto-detected by default")
-    parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
+    selector.add_argument("--universe-sample", type=int, metavar="N",
+                        help="Select up to 250 symbols from historical listings with a fixed seed, independently of anomalies")
     parser.add_argument("--output", type=Path, help="Optional results ZIP path")
     parser.add_argument("--fetch-missing-splits", action="store_true",
                         help="Use local API credentials to create absent split caches; never refresh existing files")
     args = parser.parse_args(argv)
+    if args.universe_sample is not None and not 1 <= args.universe_sample <= 250:
+        parser.error("--universe-sample must be between 1 and 250")
     if (not args.tickers or len(args.tickers) != len(set(args.tickers)) or "SPY" in args.tickers
             or any(not t or any(c in t for c in "/\\\0") or t != t.strip() for t in args.tickers)):
         parser.error("Use distinct non-SPY ticker symbols without path separators")
@@ -394,8 +441,15 @@ def main(argv=None):
         print(f"Using data folder: {root}", flush=True)
         if not (root / OBSERVATIONS).is_file() or not (root / "flatfiles/day_aggs").is_dir():
             raise FileNotFoundError("Missing master observations CSV or day_aggs folder")
+        selection = None
+        if args.universe_sample is not None:
+            print("Selecting a fixed sample from development universe snapshots...", flush=True)
+            args.tickers, selection = select_universe_sample(root, args.universe_sample)
+            print(f"Selected {len(args.tickers)} symbols independently of anomaly signals.", flush=True)
         fetched = fetch_missing_splits(root, args.tickers) if args.fetch_missing_splits else []
         report, rows = run(root, args.tickers)
+        if selection is not None:
+            report["sample_selection"] = selection
         report["missing_split_fetches"] = fetched
     except (OSError, ValueError, TypeError) as error:
         report, rows = {"status": "BLOCKED", "performance_ready": False, "error": str(error)}, []
