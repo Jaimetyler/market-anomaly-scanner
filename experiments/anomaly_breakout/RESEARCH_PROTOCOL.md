@@ -57,3 +57,41 @@ anomaly tags. Prices remain unadjusted; split completeness, point-in-time univer
 missing sessions and terminal values still block performance claims. The master
 observations CSV is not present in this repository; full anomaly-tagged execution
 still requires that local input. The 2024–2025 holdout remains excluded.
+
+## One-command local results bundle
+
+From the research checkout with the main scanner's Python environment active:
+
+```bash
+git pull --ff-only && python -m experiments.anomaly_breakout.run_local
+```
+
+The runner searches the current repository's data folder, then the sibling
+`market-anomaly-scanner/data` folder, for both the master observations and daily
+archive. For another layout pass `--data-root /path/to/data`. Default tickers are
+A, AA, AAL, AAC, AAN; override using `--tickers` with exact provider letter case.
+
+It reads the archives once, compares raw and available split-adjusted diagnostic
+signals, audits split-cache structure/ratios/identity, and inventories development
+universe snapshots. Each lineage segment uses only its own split events. Only
+2019–2023 signals are exported; 2018 is warmup. Future outcome columns are not
+signal inputs. The master file is hashed in full only for input provenance.
+
+Split helpers now import the API client only inside the network convenience
+wrapper. The runner never calls that wrapper and needs no API key or new package.
+Existing malformed/missing caches are reported without API fallback or changes.
+Legacy empty split lists are explicitly unverified, not proof of no splits.
+Mixed-case symbols cannot use uppercase legacy cache filenames. Universe
+snapshots need matching dates, active-only provenance and valid ticker records;
+missing dates stay unknown rather than borrowing future snapshots. Listing with
+a FIGI is reported separately from full observation-to-security reconciliation.
+
+The timestamped ZIP under `data/research/anomaly_breakout/local_runs/` contains
+only `summary.json`, `signals.csv` and `README.txt`. It includes hashes, cache
+coverage/errors and sampled diagnostics, never the master dataset, cache bodies,
+credentials or paper accounts. Existing outputs cannot be overwritten. Missing
+inputs still generate a blocked report (exit code 2) for troubleshooting.
+
+This bundle is an input-review handoff, not a full-market A/B backtest. Full
+universe completeness, corporate-action coverage, date-specific security mapping,
+missing sessions and terminal values remain gates before performance reporting.

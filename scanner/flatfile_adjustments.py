@@ -7,7 +7,6 @@ from dataclasses import replace
 from datetime import date
 from typing import Iterable
 
-from scanner.corporate_actions import get_stock_splits
 from scanner.flatfile_history import FlatFileBar
 
 
@@ -125,6 +124,10 @@ def get_adjusted_flatfile_history(
     ticker: str,
     bars: Iterable[FlatFileBar],
 ) -> list[FlatFileBar]:
+    # Pure adjustment helpers also serve offline research. Only the network
+    # convenience wrapper needs API configuration and corporate-action fetching.
+    from scanner.corporate_actions import get_stock_splits
+
     return adjust_flatfile_history_for_splits(
         bars,
         get_stock_splits(ticker=ticker),
