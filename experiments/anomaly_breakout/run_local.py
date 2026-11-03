@@ -1,0 +1,475 @@
+"""One-command, offline development review with a small shareable results ZIP.
+
+Uses existing local inputs by default. --fetch-missing-splits explicitly enables
+the existing provider client for absent split caches only. No portfolio simulation
+with uncertified inputs. 2024-2025 prices/universe snapshots stay outside this
+diagnostic. Legacy split-cache presence is not proof of coverage.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import importlib
+import json
+import os
+from collections import defaultdict
+from dataclasses import asdict
+from datetime import date, datetime, timezone
+from math import isfinite
+from pathlib import Path
+from types import SimpleNamespace
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from experiments.anomaly_breakout.engine import Bar, detect_signals
+from experiments.anomaly_breakout.candidate_outcomes import evaluate, summarize
+from experiments.anomaly_breakout.lineage import CONFIRMED_LINEAGE_BREAKS, lineage_segment
+from experiments.anomaly_breakout.local_adapter import read_anomaly_dates, regime_from_spy
+from scanner.flatfile_adjustments import adjust_flatfile_history_for_splits
+from scanner.flatfile_history import read_many_ticker_histories
+
+START = "2018-01-01"
+SIGNAL_START = "2019-01-01"
+END = "2023-12-31"
+DEFAULT_TICKERS = ["A", "AA", "AAL", "AAC", "AAN"]
+OBSERVATIONS = Path("research/maturity_rebuild_v1/master_observations_2019_2025.csv")
+
+
+def select_universe_sample(root: Path, size: int):
+    """Selection depends only on valid historical listings, never anomaly rows."""
+    report, _ = universe_review(root / "historical_universe", set(), [], include_symbols=True)
+    symbols = [t for t in report.pop("eligible_symbols") if t != "SPY" and
+               not any(c in t for c in "/\\\0")]
+    if not symbols:
+        raise ValueError("No usable development universe snapshots available for sampling")
+    if not 1 <= size <= 250:
+        raise ValueError("Universe sample size must be between 1 and 250")
+    seed = 20261029
+    ranked = sorted(symbols, key=lambda t: hashlib.sha256(f"{seed}:{t}".encode()).digest())
+    selected = sorted(ranked[:size])
+    return selected, {"method": "fixed_hash_rank_from_development_listing_union",
+                      "seed": seed, "requested": size, "selected": len(selected),
+                      "source_symbols": len(symbols), "usable_snapshots": report["usable_snapshots"],
+                      "source_symbols_sha256": hashlib.sha256(json.dumps(symbols).encode()).hexdigest(),
+                      "not_conditioned_on_anomalies_or_outcomes": True}
+
+
+def bars_digest(histories):
+    """Same canonical JSON fingerprint as before, without a second full copy."""
+    hasher = hashlib.sha256()
+    hasher.update(b"{")
+    for ti, (ticker, bars) in enumerate(sorted(histories.items())):
+        if ti:
+            hasher.update(b", ")
+        hasher.update((json.dumps(ticker) + ": [").encode())
+        for bi, bar in enumerate(bars):
+            if bi:
+                hasher.update(b", ")
+            hasher.update(json.dumps(asdict(bar), sort_keys=True, allow_nan=True).encode())
+        hasher.update(b"]")
+    hasher.update(b"}")
+    return hasher.hexdigest()
+
+
+def fetch_missing_splits(root: Path, tickers: list[str], progress=print):
+    """Explicit opt-in: use main scanner credentials and its bounded client.
+
+    Only absent cache files may be created. Never refresh existing/rejected files.
+    Do not export exception messages: HTTP errors can include authenticated URLs.
+    """
+    cache_root = root / "corporate_actions"
+    missing = [t for t in [*tickers, "SPY"]
+               if t == t.upper() and not (cache_root / f"{t}_splits.json").exists()]
+    if not missing:
+        return []
+    if len(missing) > 20:
+        return [{"status": "blocked", "reason": "At most 20 missing symbols can be fetched per run"}]
+    from dotenv import load_dotenv
+    load_dotenv(root.parent / ".env", override=False)
+    if not os.environ.get("MASSIVE_API_KEY"):
+        return [{"ticker": t, "status": "blocked", "reason":
+                 "MASSIVE_API_KEY unavailable in environment or main scanner .env"} for t in missing]
+    try:
+        client = importlib.import_module("scanner.corporate_actions")
+    except Exception as error:
+        return [{"ticker": t, "status": "failed", "error_type": type(error).__name__} for t in missing]
+    original_root = client.CACHE_DIR
+    results = []
+    try:
+        client.CACHE_DIR = cache_root
+        for ticker in missing:
+            # Recheck immediately before the request; the existing helper uses
+            # its cache if another process created the file in the meantime.
+            progress(f"Fetching missing split cache for {ticker}...", flush=True)
+            try:
+                client.get_stock_splits(ticker=ticker, force_refresh=False)
+                events, evidence = split_cache(cache_root, ticker)
+                results.append({"ticker": ticker, "status": "fetched" if events is not None else "rejected",
+                                "cache_sha256": evidence.get("sha256")})
+            except Exception as error:
+                results.append({"ticker": ticker, "status": "failed", "error_type": type(error).__name__})
+    finally:
+        client.CACHE_DIR = original_root
+    return results
+
+
+def summarize_signals(rows, tickers, errors):
+    """A skipped run has no measured count; a completed empty run has zero."""
+    result = {}
+    for basis in ["raw", "split_adjusted_diagnostic"]:
+        failed = [t for t in tickers if f"{basis}:{t}" in errors]
+        status = "blocked" if basis in errors or len(failed) == len(tickers) else "partial" if failed else "completed"
+        result[basis] = {"status": status,
+                         "signals": None if status == "blocked" else sum(r["basis"] == basis for r in rows),
+                         "anomaly_tagged": None if status == "blocked" else sum(r["basis"] == basis and r["anomaly"] for r in rows),
+                         "evaluated_tickers": [] if basis in errors else [t for t in tickers if t not in failed]}
+    return result
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def data_root(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    repo = Path(__file__).resolve().parents[2]
+    candidates = [repo / "data", repo.parent / "market-anomaly-scanner" / "data"]
+    for candidate in candidates:
+        if (candidate / OBSERVATIONS).is_file() and (candidate / "flatfiles/day_aggs").is_dir():
+            return candidate.resolve()
+    raise FileNotFoundError("Cannot locate master observations and day_aggs; use --data-root PATH")
+
+
+def canonical_day(value) -> str:
+    if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
+        raise ValueError("Expected an ISO YYYY-MM-DD date")
+    return value
+
+
+def split_cache(root: Path, ticker: str):
+    """Return validated development events plus evidence, never call an API.
+
+    Legacy cache names collapse letter case. Reject mixed-case symbols even if
+    an uppercase-named file exists. Empty legacy lists remain unverified.
+    """
+    path = root / f"{ticker.upper()}_splits.json"
+    evidence = {"file": path.name, "status": "missing", "events": 0}
+    if ticker != ticker.upper():
+        evidence.update(status="rejected", reason="Legacy uppercase cache cannot establish exact ticker identity")
+        return None, evidence
+    if not path.is_file():
+        return None, evidence
+    try:
+        raw_bytes = path.read_bytes()
+        evidence["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+        payload = json.loads(raw_bytes)
+        if not isinstance(payload, list):
+            raise ValueError("Expected the legacy list of split events")
+        events = []
+        seen = set()
+        for row in payload:
+            if not isinstance(row, dict):
+                raise ValueError("Split event is not an object")
+            day = canonical_day(row.get("execution_date") or row.get("ex_date") or row.get("date"))
+            if not START <= day <= END:
+                continue
+            if row.get("ticker") != ticker:
+                raise ValueError("Split event ticker is missing or does not exactly match")
+            values = [row.get("split_from"), row.get("split_to")]
+            if any(isinstance(v, bool) for v in values):
+                raise ValueError("Invalid split ratio")
+            before, after = map(float, values)
+            if not all(isfinite(v) and v > 0 for v in (before, after)):
+                raise ValueError("Invalid split ratio")
+            if day in seen:
+                raise ValueError("Duplicate or conflicting split execution dates")
+            seen.add(day)
+            events.append(SimpleNamespace(execution_date=day, split_from=before, split_to=after))
+        evidence.update(status="available_unverified", events=len(events),
+                        coverage="Legacy lists contain no query coverage/pagination evidence")
+        return events, evidence
+    except (OSError, ValueError, TypeError) as error:
+        evidence.update(status="rejected", reason=str(error))
+        return None, evidence
+
+
+def convert(bars):
+    return [Bar(b.session_date, b.open, b.high, b.low, b.close, b.volume) for b in bars]
+
+
+def segments(ticker, bars):
+    result = defaultdict(list)
+    for bar in bars:
+        result[lineage_segment(ticker, bar.session_date)].append(bar)
+    return result
+
+
+def adjusted(ticker, bars, events):
+    """A later company's splits must never adjust an earlier company's bars."""
+    output = []
+    for segment, items in segments(ticker, bars).items():
+        own_events = [e for e in events if lineage_segment(ticker, e.execution_date) == segment]
+        output.extend(adjust_flatfile_history_for_splits(items, own_events))
+    return output
+
+
+def signal_rows(ticker, bars, anomalies, regime, basis):
+    rows = []
+    # Validate the whole input too: partitioning must not conceal out-of-order
+    # dates, duplicates or invalid bars from the detector's normal checks.
+    detect_signals(ticker, convert(bars), set(), {})
+    for segment, items in segments(ticker, bars).items():
+        own_anomalies = {day for day in anomalies if lineage_segment(ticker, day) == segment}
+        for signal in detect_signals(ticker, convert(items), own_anomalies, regime):
+            if SIGNAL_START <= signal.signal_date <= END:
+                rows.append({"basis": basis, **asdict(signal)})
+    return rows
+
+
+def price_review(bars, spy_dates):
+    dates = [b.session_date for b in bars]
+    date_set = set(dates)
+    first, last = (min(dates), max(dates)) if dates else (None, None)
+    valid = all(all(isfinite(v) for v in (b.open, b.high, b.low, b.close, b.volume))
+                and 0 < b.low <= min(b.open, b.close)
+                and b.high >= max(b.open, b.close) and b.volume >= 0 for b in bars)
+    missing = sorted(d for d in spy_dates if dates and first <= d <= last and d not in date_set)
+    return {"bars": len(bars), "first": first, "last": last,
+            "valid_ohlcv": valid, "sorted_unique_dates": dates == sorted(set(dates)),
+            "missing_vs_spy_within_observed_span": len(missing), "missing_sample": missing[:20]}
+
+
+def universe_review(root: Path, expected_days: set[str], tickers: list[str], *, include_symbols=False):
+    """Inspect exact-date snapshots; never fill gaps with a future snapshot."""
+    inventory, membership, union = [], {}, set()
+    for path in sorted(root.glob("*.json")):
+        try:
+            day = canonical_day(path.stem)
+        except (ValueError, TypeError):
+            continue
+        if not SIGNAL_START <= day <= END:
+            continue
+        evidence = {"date": day, "file": path.name, "status": "rejected"}
+        try:
+            raw_bytes = path.read_bytes()
+            evidence["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+            payload = json.loads(raw_bytes)
+            if not isinstance(payload, dict) or payload.get("as_of_date") != day or payload.get("active_only") is not True:
+                raise ValueError("Missing exact as_of_date or active_only=true")
+            records = payload.get("tickers")
+            if not isinstance(records, list) or not records:
+                raise ValueError("Missing or empty ticker snapshot")
+            eligible = {}
+            missing_ids = 0
+            for row in records:
+                if not isinstance(row, dict) or not isinstance(row.get("ticker"), str) or not row["ticker"].strip():
+                    raise ValueError("Malformed ticker record")
+                if row.get("type") != "CS" or row.get("primary_exchange") not in {"XNYS", "XNAS", "XASE"}:
+                    continue
+                if row.get("active") is not True:
+                    raise ValueError("Eligible ticker lacks active=true")
+                ticker = row["ticker"].strip()  # retain provider letter case
+                identity = row.get("composite_figi")
+                if identity is not None and not isinstance(identity, str):
+                    raise ValueError("Invalid composite FIGI")
+                if ticker in eligible:
+                    raise ValueError("Duplicate ticker in one dated snapshot")
+                eligible[ticker] = identity
+                missing_ids += not bool(identity)
+            if not eligible:
+                raise ValueError("No eligible common stocks in snapshot")
+            membership[day] = {ticker: eligible[ticker] for ticker in tickers if ticker in eligible}
+            union.update(eligible)
+            evidence.update(status="available_unverified", eligible=len(eligible), missing_figi=missing_ids)
+        except (OSError, ValueError, TypeError) as error:
+            evidence["reason"] = str(error)
+        inventory.append(evidence)
+    missing = sorted(expected_days - set(membership))
+    report = {"snapshots": len(inventory), "usable_snapshots": len(membership),
+            "expected_spy_development_sessions": len(expected_days),
+            "missing_sessions": len(missing), "missing_sample": missing[:25],
+            "distinct_eligible_symbols": len(union),
+            "coverage": "Legacy snapshots do not certify pagination or security lineage",
+            "inventory": inventory}
+    if include_symbols:
+        report["eligible_symbols"] = sorted(union)
+    return report, membership
+
+
+def membership_status(membership, day, ticker):
+    if day not in membership:
+        return "unknown_no_valid_snapshot"
+    if ticker not in membership[day]:
+        return "not_eligible"
+    return "listed_with_figi" if membership[day][ticker] else "listed_missing_figi"
+
+
+def run(root: Path, tickers: list[str], progress=print):
+    observations = root / OBSERVATIONS
+    if not observations.is_file() or not (root / "flatfiles/day_aggs").is_dir():
+        raise FileNotFoundError("Missing master observations CSV or day_aggs folder")
+    report = {"kind": "OFFLINE_INPUT_REVIEW_AND_SIGNAL_DIAGNOSTIC", "performance_ready": False,
+              "development": [SIGNAL_START, END], "warmup_start": START, "tickers": tickers,
+              "observations_sha256": digest(observations),
+              "lineage_boundaries": {t: sorted(CONFIRMED_LINEAGE_BREAKS.get(t, ())) for t in tickers},
+              "blockers": ["Selected-ticker diagnostic is not a full-market baseline",
+                           "Legacy cache coverage and identity mapping require verification",
+                           "Missing-session and delisting/terminal-value policy require review",
+                           "No portfolio comparison or profitability claim in this report"]}
+    progress("Reading eligible anomaly dates (2019-2023 only)...", flush=True)
+    identity_errors = {}
+    try:
+        anomalies = read_anomaly_dates(observations, tickers=tickers, lineage_aware=True, identity_errors=identity_errors)
+    except (OSError, ValueError, TypeError) as error:
+        report["observation_error"] = str(error)
+        report["status"] = "BLOCKED"
+        return report, []
+    progress("Reading 2018-2023 daily archives once; this may take a few minutes...", flush=True)
+    histories = read_many_ticker_histories([*tickers, "SPY"], START, END, root=root / "flatfiles/day_aggs")
+    spy = histories.get("SPY", [])
+    spy_dates = {b.session_date for b in spy}
+    report["prices"] = {t: price_review(histories.get(t, []), spy_dates) for t in [*tickers, "SPY"]}
+    # Fingerprint the exact selected bars, not the multi-hundred-MB archives.
+    report["selected_bars_sha256"] = bars_digest(histories)
+    report["excluded_observation_identities"] = identity_errors
+    progress("Checking split caches and exact-date universe snapshots...", flush=True)
+    caches, evidence = {}, {}
+    for ticker in [*tickers, "SPY"]:
+        caches[ticker], evidence[ticker] = split_cache(root / "corporate_actions", ticker)
+    report["splits"] = evidence
+    report["universe"], membership = universe_review(
+        root / "historical_universe", {d for d in spy_dates if SIGNAL_START <= d <= END}, tickers)
+    rows = []
+    report["signal_errors"] = {}
+    spy_review = report["prices"]["SPY"]
+    if len(spy) < 200 or not spy_review["valid_ohlcv"] or not spy_review["sorted_unique_dates"]:
+        report["status"] = "BLOCKED"
+        report["signal_errors"]["SPY"] = "Insufficient or invalid SPY history"
+        return report, rows
+    for basis in ["raw", "split_adjusted_diagnostic"]:
+        if basis != "raw" and caches["SPY"] is None:
+            report["signal_errors"][basis] = "SPY split cache missing or rejected; adjusted market filter unavailable"
+            continue
+        try:
+            market = spy if basis == "raw" else adjusted("SPY", spy, caches["SPY"])
+            detect_signals("SPY", convert(market), set(), {})
+            regime = regime_from_spy(convert(market))
+        except ValueError as error:
+            report["signal_errors"][basis] = str(error)
+            continue
+        for ticker in tickers:
+            if ticker in identity_errors:
+                report["signal_errors"][f"{basis}:{ticker}"] = identity_errors[ticker]
+                continue
+            bars = histories.get(ticker, [])
+            if len(bars) < 22:
+                report["signal_errors"][f"{basis}:{ticker}"] = "Insufficient price history"
+                continue
+            if basis != "raw" and caches[ticker] is None:
+                report["signal_errors"][f"{basis}:{ticker}"] = "Split cache missing or rejected"
+                continue
+            try:
+                prices = bars if basis == "raw" else adjusted(ticker, bars, caches[ticker])
+                rows.extend(signal_rows(ticker, prices, anomalies.get(ticker, set()), regime, basis))
+            except (ValueError, OverflowError) as error:
+                report["signal_errors"][f"{basis}:{ticker}"] = str(error)
+    for row in rows:
+        row["signal_universe_status"] = membership_status(membership, row["signal_date"], row["ticker"])
+        row["entry_universe_status"] = membership_status(membership, row["entry_date"], row["ticker"])
+    rows.sort(key=lambda row: (row["basis"], row["signal_date"], row["ticker"]))
+    report["signals"] = summarize_signals(rows, tickers, report["signal_errors"])
+    if report["signals"]["split_adjusted_diagnostic"]["status"] != "blocked":
+        candidate_rows = []
+        for ticker in tickers:
+            selected = [r for r in rows if r["basis"] == "split_adjusted_diagnostic" and r["ticker"] == ticker]
+            if not selected:
+                continue
+            prices = convert(adjusted(ticker, histories[ticker], caches[ticker]))
+            candidate_rows.extend(evaluate(r, prices, spy_dates) for r in selected)
+        report["candidate_review"] = {"status": "exploratory", **summarize(candidate_rows), "outcomes": candidate_rows}
+    else:
+        report["candidate_review"] = {"status": "not_run", "reason": "Adjusted signal diagnostic blocked"}
+    report["status"] = "REVIEW_REQUIRED"
+    return report, rows
+
+
+def write_bundle(report, rows, output: Path):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    signals = io.StringIO(newline="")
+    writer = csv.DictWriter(signals, fieldnames=["basis", "ticker", "signal_date", "entry_date", "stop", "anomaly",
+                                               "signal_universe_status", "entry_universe_status"])
+    writer.writeheader()
+    writer.writerows(rows)
+    code = Path(__file__).resolve()
+    report["runner_sha256"] = digest(code)
+    report["code_sha256"] = {p.name: digest(p) for p in [code.with_name(n) for n in
+        ("engine.py", "local_adapter.py", "lineage.py", "candidate_outcomes.py")] + [code.parents[2] / "scanner/flatfile_adjustments.py"]}
+    report["generated_utc"] = datetime.now(timezone.utc).isoformat()
+    with ZipFile(output, "x", ZIP_DEFLATED) as archive:
+        archive.writestr("summary.json", json.dumps(report, indent=2, allow_nan=False))
+        archive.writestr("signals.csv", signals.getvalue())
+        archive.writestr("README.txt", "Offline 2019-2023 input review and signal diagnostics only.\n"
+                         "No source dataset, credentials or paper accounts included.\n"
+                         "Split-adjusted diagnostics use available legacy caches; completeness is unverified.\n"
+                         "Independent candidate outcomes are exploratory, may overlap and are not portfolio returns.\n"
+                         "No full-universe portfolio backtest or profitability claim.\n")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, help="Main scanner data folder; auto-detected by default")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
+    selector.add_argument("--universe-sample", type=int, metavar="N",
+                        help="Select up to 250 symbols from historical listings with a fixed seed, independently of anomalies")
+    parser.add_argument("--output", type=Path, help="Optional results ZIP path")
+    parser.add_argument("--fetch-missing-splits", action="store_true",
+                        help="Use local API credentials to create absent split caches; never refresh existing files")
+    args = parser.parse_args(argv)
+    if args.universe_sample is not None and not 1 <= args.universe_sample <= 250:
+        parser.error("--universe-sample must be between 1 and 250")
+    if (not args.tickers or len(args.tickers) != len(set(args.tickers)) or "SPY" in args.tickers
+            or any(not t or any(c in t for c in "/\\\0") or t != t.strip() for t in args.tickers)):
+        parser.error("Use distinct non-SPY ticker symbols without path separators")
+    output = args.output or Path("data/research/anomaly_breakout/local_runs") / (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_scanner_results.zip")
+    try:
+        root = data_root(args.data_root)
+        print(f"Using data folder: {root}", flush=True)
+        if not (root / OBSERVATIONS).is_file() or not (root / "flatfiles/day_aggs").is_dir():
+            raise FileNotFoundError("Missing master observations CSV or day_aggs folder")
+        selection = None
+        if args.universe_sample is not None:
+            print("Selecting a fixed sample from development universe snapshots...", flush=True)
+            args.tickers, selection = select_universe_sample(root, args.universe_sample)
+            print(f"Selected {len(args.tickers)} symbols independently of anomaly signals.", flush=True)
+        fetched = fetch_missing_splits(root, args.tickers) if args.fetch_missing_splits else []
+        report, rows = run(root, args.tickers)
+        if selection is not None:
+            report["sample_selection"] = selection
+        report["missing_split_fetches"] = fetched
+    except (OSError, ValueError, TypeError) as error:
+        report, rows = {"status": "BLOCKED", "performance_ready": False, "error": str(error)}, []
+    write_bundle(report, rows, output)
+    for basis, counts in report.get("signals", {}).items():
+        if counts["status"] == "blocked":
+            print(f"{basis}: NOT RUN - {report['signal_errors'].get(basis, 'No tickers could be evaluated')}")
+        else:
+            print(f"{basis} ({counts['status']}): {counts['signals']} signals; {counts['anomaly_tagged']} anomaly-tagged")
+    for attempt in report.get("missing_split_fetches", []):
+        if attempt["status"] in {"blocked", "failed", "rejected"}:
+            print(f"Split cache fetch: {attempt.get('ticker', '')} {attempt['status']} "
+                  f"({attempt.get('reason') or attempt.get('error_type') or 'Cache rejected'})")
+    if report.get("error") or report.get("observation_error"):
+        print(report.get("error") or report["observation_error"])
+    print(f"Status: {report['status']}. Diagnostic only; no performance claim.")
+    print(f"Upload this small results file: {output.resolve()}")
+    print(f"Size: {output.stat().st_size / 1024:.1f} KB")
+    return 2 if report["status"] == "BLOCKED" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
