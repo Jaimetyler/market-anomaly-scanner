@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from experiments.anomaly_breakout.engine import Bar, detect_signals
+from experiments.anomaly_breakout.candidate_outcomes import evaluate, summarize
 from experiments.anomaly_breakout.lineage import CONFIRMED_LINEAGE_BREAKS, lineage_segment
 from experiments.anomaly_breakout.local_adapter import read_anomaly_dates, regime_from_spy
 from scanner.flatfile_adjustments import adjust_flatfile_history_for_splits
@@ -338,6 +339,17 @@ def run(root: Path, tickers: list[str], progress=print):
         row["entry_universe_status"] = membership_status(membership, row["entry_date"], row["ticker"])
     rows.sort(key=lambda row: (row["basis"], row["signal_date"], row["ticker"]))
     report["signals"] = summarize_signals(rows, tickers, report["signal_errors"])
+    if report["signals"]["split_adjusted_diagnostic"]["status"] != "blocked":
+        candidate_rows = []
+        for ticker in tickers:
+            selected = [r for r in rows if r["basis"] == "split_adjusted_diagnostic" and r["ticker"] == ticker]
+            if not selected:
+                continue
+            prices = convert(adjusted(ticker, histories[ticker], caches[ticker]))
+            candidate_rows.extend(evaluate(r, prices, spy_dates) for r in selected)
+        report["candidate_review"] = {"status": "exploratory", **summarize(candidate_rows), "outcomes": candidate_rows}
+    else:
+        report["candidate_review"] = {"status": "not_run", "reason": "Adjusted signal diagnostic blocked"}
     report["status"] = "REVIEW_REQUIRED"
     return report, rows
 
@@ -352,7 +364,7 @@ def write_bundle(report, rows, output: Path):
     code = Path(__file__).resolve()
     report["runner_sha256"] = digest(code)
     report["code_sha256"] = {p.name: digest(p) for p in [code.with_name(n) for n in
-        ("engine.py", "local_adapter.py", "lineage.py")] + [code.parents[2] / "scanner/flatfile_adjustments.py"]}
+        ("engine.py", "local_adapter.py", "lineage.py", "candidate_outcomes.py")] + [code.parents[2] / "scanner/flatfile_adjustments.py"]}
     report["generated_utc"] = datetime.now(timezone.utc).isoformat()
     with ZipFile(output, "x", ZIP_DEFLATED) as archive:
         archive.writestr("summary.json", json.dumps(report, indent=2, allow_nan=False))
@@ -360,6 +372,7 @@ def write_bundle(report, rows, output: Path):
         archive.writestr("README.txt", "Offline 2019-2023 input review and signal diagnostics only.\n"
                          "No source dataset, credentials or paper accounts included.\n"
                          "Split-adjusted diagnostics use available legacy caches; completeness is unverified.\n"
+                         "Independent candidate outcomes are exploratory, may overlap and are not portfolio returns.\n"
                          "No full-universe portfolio backtest or profitability claim.\n")
 
 

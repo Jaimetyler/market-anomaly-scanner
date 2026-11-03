@@ -118,3 +118,24 @@ evaluated-ticker list. A blocked basis reports null counts and prints `NOT RUN`,
 rather than reporting a misleading zero. A completed run with no setups retains
 a real zero. Successful cache retrieval does not certify unrelated legacy caches
 or mark the overall report ready for portfolio performance analysis.
+
+### Exploratory candidate outcomes
+
+After a completed or partial adjusted diagnostic the bundle includes independent
+candidate outcomes, grouped into all sample breakouts, the anomaly subset and
+breakouts without anomalies. These candidates may overlap and are not portfolio
+returns. No new parameter search or holdout reads are performed.
+
+The frozen diagnostic rule is next-session open entry, fixed signal stop, or close
+of the 20th held session **including** entry day. Costs are 10 bps on each fill and
+$0.005 per share each way. Gap-through stops fill at the opening price; entry-day
+stop touches are charged. Identity listings without FIGIs are excluded. Missing
+market sessions, lineage changes and unavailable development-period exits censor
+candidates rather than silently assigning returns. Completed, censored and
+excluded counts are reported separately; averages and win rates use completed
+candidates only. Net R divides net P&L per share by entry fill minus signal stop.
+
+This is a descriptive check of the selected ticker sample. Security mapping and
+legacy corporate-action completeness remain unverified. It cannot establish an
+anomaly advantage, annual performance or the feasibility of taking overlapping
+signals under cash/risk constraints.
