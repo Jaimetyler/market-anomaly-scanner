@@ -13,5 +13,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_anomaly_breakout_engine.py
+      - run: python -m pip install pytest python-dotenv
+      - run: python -m pytest -q tests/test_anomaly_breakout_engine.py tests/test_anomaly_breakout_adapter.py tests/test_anomaly_breakout_lineage.py

@@ -4,13 +4,7 @@ import argparse
 import csv
 from pathlib import Path
 from scanner.flatfile_history import read_many_ticker_histories
-# Reviewed offline boundaries; synchronize with scanner/turtle_history.py.
-CONFIRMED_LINEAGE_BREAKS = {
-    "AABA": frozenset({"2019-09-24"}),
-    "AAN": frozenset({"2020-12-01"}),
-    "AAC": frozenset({"2021-03-25"}),
-    "ACET": frozenset({"2020-09-16"}),
-}
+from experiments.anomaly_breakout.lineage import CONFIRMED_LINEAGE_BREAKS
 
 
 def main():

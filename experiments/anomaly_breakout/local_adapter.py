@@ -6,20 +6,25 @@ from collections import defaultdict
 from pathlib import Path
 
 from experiments.anomaly_breakout.engine import Bar, detect_signals
+from experiments.anomaly_breakout.lineage import lineage_segment
 from scanner.flatfile_history import read_many_ticker_histories
 
 DEVELOPMENT_END = "2023-12-31"
 
 
-def read_anomaly_dates(path: str | Path, *, tickers: list[str] | None = None) -> dict[str, set[str]]:
+def read_anomaly_dates(
+    path: str | Path, *, tickers: list[str] | None = None,
+    lineage_aware: bool = False,
+) -> dict[str, set[str]]:
     """Eligible observations only. Exact case-sensitive provider ticker retained.
 
     The observation's security_id is also tracked; any ticker with multiple
-    identities is rejected until a date-specific identity mapping is audited.
+    identities is rejected. With lineage_aware=True, reviewed boundaries scope
+    that check to each independent segment. Callers must split price windows too.
     """
     selected = set(tickers) if tickers is not None else None
     dates: dict[str, set[str]] = defaultdict(set)
-    identities: dict[str, set[str]] = defaultdict(set)
+    identities: dict[tuple[str, int], set[str]] = defaultdict(set)
     with Path(path).open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         required = {"ticker", "security_id", "signal_date", "research_eligible", "ca_excluded"}
@@ -32,10 +37,11 @@ def read_anomaly_dates(path: str | Path, *, tickers: list[str] | None = None) ->
             ticker = row["ticker"].strip()
             if selected is not None and ticker not in selected:
                 continue
-            identities[ticker].add(row["security_id"].strip())
+            segment = lineage_segment(ticker, day) if lineage_aware else 0
+            identities[ticker, segment].add(row["security_id"].strip())
             if row["research_eligible"].strip().lower() == "true" and row["ca_excluded"].strip().lower() != "true":
                 dates[ticker].add(day)
-    ambiguous = sorted(t for t, ids in identities.items() if len(ids) != 1 or "" in ids)
+    ambiguous = sorted(key for key, ids in identities.items() if len(ids) != 1 or "" in ids)
     if ambiguous:
         raise ValueError(f"Ticker identity ambiguity (sample): {ambiguous[:20]}")
     return dict(dates)
@@ -65,7 +71,7 @@ def raw_development_smoke(
     """
     if not tickers or len(set(tickers)) != len(tickers):
         raise ValueError("Provide unique ticker symbols")
-    anomaly = read_anomaly_dates(observation_csv, tickers=tickers)
+    anomaly = read_anomaly_dates(observation_csv, tickers=tickers, lineage_aware=True)
     histories = read_many_ticker_histories(
         [*tickers, "SPY"], start, DEVELOPMENT_END, root=root, progress=False
     )
@@ -83,5 +89,16 @@ def raw_development_smoke(
         bars = convert(histories[ticker])
         if len(bars) < 22:
             continue
-        signals.extend(detect_signals(ticker, bars, anomaly.get(ticker, set()), regime))
+        # Each detector invocation starts with fresh lookbacks and has no entry
+        # bar from the next identity. Even tickers with only one observed FIGI
+        # (e.g. AAC) still require these price-history boundaries.
+        segments = defaultdict(list)
+        for bar in bars:
+            segments[lineage_segment(ticker, bar.date)].append(bar)
+        for segment, segment_bars in segments.items():
+            segment_anomalies = {
+                day for day in anomaly.get(ticker, set())
+                if lineage_segment(ticker, day) == segment
+            }
+            signals.extend(detect_signals(ticker, segment_bars, segment_anomalies, regime))
     return sorted(signals, key=lambda x: (x.signal_date, x.ticker))

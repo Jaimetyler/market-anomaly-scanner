@@ -38,3 +38,22 @@ Compare a price/volume volatility-contraction breakout baseline (A) with the ide
 
 ## Next implementation
 Create independent `experiments/anomaly_breakout/` modules and tests. Start with signal generation and a reproducible input manifest, then implement portfolio simulation. Local execution is required for data-dependent integration tests.
+
+## Offline lineage diagnostic
+
+The raw diagnostic now splits AAC, AAN, AABA and ACET at the reviewed dates in
+`lineage.py`, shared with the offline audit. A boundary date belongs to the new
+segment. Each segment starts fresh price/volume and anomaly lookbacks, and the
+last bar of an old segment cannot enter at the new segment's open.
+
+Observation IDs are checked within each segment, including excluded observations.
+Conflicting or blank IDs within one segment still fail. Unreviewed multi-ID
+tickers still fail. The standalone `read_anomaly_dates` API keeps its conservative
+whole-ticker check unless `lineage_aware=True` is explicitly requested.
+
+This implements boundary isolation, not full identity certification. A segment
+without observations may still emit baseline diagnostic signals, but receives no
+anomaly tags. Prices remain unadjusted; split completeness, point-in-time universe,
+missing sessions and terminal values still block performance claims. The master
+observations CSV is not present in this repository; full anomaly-tagged execution
+still requires that local input. The 2024–2025 holdout remains excluded.
