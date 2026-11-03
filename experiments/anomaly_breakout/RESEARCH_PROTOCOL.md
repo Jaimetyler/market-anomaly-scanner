@@ -95,3 +95,26 @@ inputs still generate a blocked report (exit code 2) for troubleshooting.
 This bundle is an input-review handoff, not a full-market A/B backtest. Full
 universe completeness, corporate-action coverage, date-specific security mapping,
 missing sessions and terminal values remain gates before performance reporting.
+
+### Missing split-cache repair
+
+If the bundle reports a missing split cache (for example SPY), run:
+
+```bash
+git pull --ff-only && python -m experiments.anomaly_breakout.run_local --fetch-missing-splits
+```
+
+This flag opts in to the existing bounded Massive split client for **absent**
+sample/benchmark cache files only (maximum 20 symbols per run, existing client
+pagination bound 20 pages per symbol). It loads `MASSIVE_API_KEY` from the current
+environment or the main scanner's `.env` without exporting it. Existing caches,
+including rejected files, are never intentionally refreshed. Fetch errors export
+only the exception type; authenticated HTTP URLs are omitted. Network requests
+do not occur without this flag. Missing credentials or request failures still
+produce a results ZIP with the blocker recorded.
+
+Each signal basis now has `completed`, `partial` or `blocked` status and an
+evaluated-ticker list. A blocked basis reports null counts and prints `NOT RUN`,
+rather than reporting a misleading zero. A completed run with no setups retains
+a real zero. Successful cache retrieval does not certify unrelated legacy caches
+or mark the overall report ready for portfolio performance analysis.

@@ -133,8 +133,9 @@ def test_file_backed_cli_without_api_key_exports_only_small_results(tmp_path):
         assert set(archive.namelist()) == {"summary.json", "signals.csv", "README.txt"}
         summary = json.loads(archive.read("summary.json"))
         assert summary["performance_ready"] is False
-        assert summary["signals"]["raw"] == {"signals": 1, "anomaly_tagged": 1}
-        assert summary["signals"]["split_adjusted_diagnostic"] == {"signals": 1, "anomaly_tagged": 1}
+        for basis in ["raw", "split_adjusted_diagnostic"]:
+            assert summary["signals"][basis] == {"signals": 1, "anomaly_tagged": 1,
+                                                "status": "completed", "evaluated_tickers": ["XYZ"]}
         signals = archive.read("signals.csv").decode()
         assert "listed_with_figi" in signals
         assert "DO_NOT_USE" not in signals
@@ -177,6 +178,90 @@ def test_missing_split_caches_preserve_raw_results_and_report_block(tmp_path):
     (root / "corporate_actions/SPY_splits.json").unlink()
     report, rows = runner.run(root, ["XYZ"], progress=lambda *a, **k: None)
     assert report["signals"]["raw"]["signals"] == 1
-    assert report["signals"]["split_adjusted_diagnostic"]["signals"] == 0
+    assert report["signals"]["split_adjusted_diagnostic"]["signals"] is None
+    assert report["signals"]["split_adjusted_diagnostic"]["status"] == "blocked"
     assert "SPY split cache" in report["signal_errors"]["split_adjusted_diagnostic"]
     assert report["performance_ready"] is False
+
+
+def test_fetch_only_missing_uses_main_cache_and_keeps_credentials_private(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    create_inputs(root)
+    original = (root / "corporate_actions/XYZ_splits.json").read_bytes()
+    (root / "corporate_actions/SPY_splits.json").unlink()
+    monkeypatch.setenv("MASSIVE_API_KEY", "TEST_SECRET_NOT_FOR_EXPORT")
+    calls = []
+    client = SimpleNamespace(CACHE_DIR=Path("original"))
+    def fetch(ticker, force_refresh):
+        calls.append((ticker, force_refresh))
+        assert client.CACHE_DIR == root / "corporate_actions"
+        save(client.CACHE_DIR / f"{ticker}_splits.json", [])
+    client.get_stock_splits = fetch
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _: client)
+    results = runner.fetch_missing_splits(root, ["XYZ"], progress=lambda *a, **k: None)
+    assert calls == [("SPY", False)]
+    assert results[0]["status"] == "fetched"
+    assert client.CACHE_DIR == Path("original")
+    assert (root / "corporate_actions/XYZ_splits.json").read_bytes() == original
+    assert "TEST_SECRET" not in json.dumps(results)
+    report, _ = runner.run(root, ["XYZ"], progress=lambda *a, **k: None)
+    assert report["signals"]["split_adjusted_diagnostic"]["status"] == "completed"
+
+
+def test_fetch_errors_are_redacted_and_cache_root_restored(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.setenv("MASSIVE_API_KEY", "SECRET")
+    def fetch(**kwargs):
+        raise RuntimeError("https://api.massive.com?apiKey=SECRET")
+    client = SimpleNamespace(CACHE_DIR=Path("original"), get_stock_splits=fetch)
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _: client)
+    results = runner.fetch_missing_splits(root, [], progress=lambda *a, **k: None)
+    assert results == [{"ticker": "SPY", "status": "failed", "error_type": "RuntimeError"}]
+    assert client.CACHE_DIR == Path("original")
+    assert "SECRET" not in json.dumps(results)
+
+
+def test_cache_repair_is_opt_in_and_never_refreshes_rejected_file(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    create_inputs(root)
+    invalid = root / "corporate_actions/SPY_splits.json"
+    invalid.write_text("invalid cache")
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _: pytest.fail("Existing cache must not be fetched"))
+    assert runner.fetch_missing_splits(root, ["XYZ"]) == []
+    assert invalid.read_text() == "invalid cache"
+
+
+def test_no_api_key_reports_missing_configuration_without_import(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _: pytest.fail("Client import must be deferred"))
+    results = runner.fetch_missing_splits(root, [])
+    assert results[0]["status"] == "blocked"
+
+
+def test_completed_zero_is_distinct_from_skipped_and_partial():
+    result = runner.summarize_signals([], ["A"], {})
+    assert result["raw"]["status"] == "completed" and result["raw"]["signals"] == 0
+    result = runner.summarize_signals([], ["A"], {"split_adjusted_diagnostic": "missing SPY"})
+    assert result["split_adjusted_diagnostic"]["signals"] is None
+    result = runner.summarize_signals([], ["A", "AA"], {"raw:A": "invalid bars"})
+    assert result["raw"]["status"] == "partial" and result["raw"]["evaluated_tickers"] == ["AA"]
+
+
+def test_cli_failed_repair_still_exports_not_run_report(tmp_path):
+    root = tmp_path / "data"
+    create_inputs(root)
+    (root / "corporate_actions/SPY_splits.json").unlink()
+    output = tmp_path / "repair_blocked.zip"
+    env = {k: v for k, v in os.environ.items() if k != "MASSIVE_API_KEY"}
+    result = subprocess.run([sys.executable, "-m", "experiments.anomaly_breakout.run_local",
+                             "--data-root", str(root), "--tickers", "XYZ", "--output", str(output),
+                             "--fetch-missing-splits"], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "split_adjusted_diagnostic: NOT RUN" in result.stdout
+    with ZipFile(output) as archive:
+        report = json.loads(archive.read("summary.json"))
+    assert report["missing_split_fetches"][0]["status"] == "blocked"
+    assert report["signals"]["split_adjusted_diagnostic"]["signals"] is None

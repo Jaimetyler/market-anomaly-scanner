@@ -1,8 +1,9 @@
 """One-command, offline development review with a small shareable results ZIP.
 
-Uses existing local inputs only. Never fetches, refreshes caches, reads credentials,
-or simulates portfolios with uncertified inputs. 2024-2025 prices/universe snapshots
-are outside this diagnostic. Legacy split-cache presence is not proof of coverage.
+Uses existing local inputs by default. --fetch-missing-splits explicitly enables
+the existing provider client for absent split caches only. No portfolio simulation
+with uncertified inputs. 2024-2025 prices/universe snapshots stay outside this
+diagnostic. Legacy split-cache presence is not proof of coverage.
 """
 from __future__ import annotations
 
@@ -10,7 +11,9 @@ import argparse
 import csv
 import hashlib
 import io
+import importlib
 import json
+import os
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -30,6 +33,61 @@ SIGNAL_START = "2019-01-01"
 END = "2023-12-31"
 DEFAULT_TICKERS = ["A", "AA", "AAL", "AAC", "AAN"]
 OBSERVATIONS = Path("research/maturity_rebuild_v1/master_observations_2019_2025.csv")
+
+
+def fetch_missing_splits(root: Path, tickers: list[str], progress=print):
+    """Explicit opt-in: use main scanner credentials and its bounded client.
+
+    Only absent cache files may be created. Never refresh existing/rejected files.
+    Do not export exception messages: HTTP errors can include authenticated URLs.
+    """
+    cache_root = root / "corporate_actions"
+    missing = [t for t in [*tickers, "SPY"]
+               if t == t.upper() and not (cache_root / f"{t}_splits.json").exists()]
+    if not missing:
+        return []
+    if len(missing) > 20:
+        return [{"status": "blocked", "reason": "At most 20 missing symbols can be fetched per run"}]
+    from dotenv import load_dotenv
+    load_dotenv(root.parent / ".env", override=False)
+    if not os.environ.get("MASSIVE_API_KEY"):
+        return [{"ticker": t, "status": "blocked", "reason":
+                 "MASSIVE_API_KEY unavailable in environment or main scanner .env"} for t in missing]
+    try:
+        client = importlib.import_module("scanner.corporate_actions")
+    except Exception as error:
+        return [{"ticker": t, "status": "failed", "error_type": type(error).__name__} for t in missing]
+    original_root = client.CACHE_DIR
+    results = []
+    try:
+        client.CACHE_DIR = cache_root
+        for ticker in missing:
+            # Recheck immediately before the request; the existing helper uses
+            # its cache if another process created the file in the meantime.
+            progress(f"Fetching missing split cache for {ticker}...", flush=True)
+            try:
+                client.get_stock_splits(ticker=ticker, force_refresh=False)
+                events, evidence = split_cache(cache_root, ticker)
+                results.append({"ticker": ticker, "status": "fetched" if events is not None else "rejected",
+                                "cache_sha256": evidence.get("sha256")})
+            except Exception as error:
+                results.append({"ticker": ticker, "status": "failed", "error_type": type(error).__name__})
+    finally:
+        client.CACHE_DIR = original_root
+    return results
+
+
+def summarize_signals(rows, tickers, errors):
+    """A skipped run has no measured count; a completed empty run has zero."""
+    result = {}
+    for basis in ["raw", "split_adjusted_diagnostic"]:
+        failed = [t for t in tickers if f"{basis}:{t}" in errors]
+        status = "blocked" if basis in errors or len(failed) == len(tickers) else "partial" if failed else "completed"
+        result[basis] = {"status": status,
+                         "signals": None if status == "blocked" else sum(r["basis"] == basis for r in rows),
+                         "anomaly_tagged": None if status == "blocked" else sum(r["basis"] == basis and r["anomaly"] for r in rows),
+                         "evaluated_tickers": [] if basis in errors else [t for t in tickers if t not in failed]}
+    return result
 
 
 def digest(path: Path) -> str:
@@ -279,9 +337,7 @@ def run(root: Path, tickers: list[str], progress=print):
         row["signal_universe_status"] = membership_status(membership, row["signal_date"], row["ticker"])
         row["entry_universe_status"] = membership_status(membership, row["entry_date"], row["ticker"])
     rows.sort(key=lambda row: (row["basis"], row["signal_date"], row["ticker"]))
-    report["signals"] = {basis: {"signals": sum(r["basis"] == basis for r in rows),
-                                "anomaly_tagged": sum(r["basis"] == basis and r["anomaly"] for r in rows)}
-                         for basis in ["raw", "split_adjusted_diagnostic"]}
+    report["signals"] = summarize_signals(rows, tickers, report["signal_errors"])
     report["status"] = "REVIEW_REQUIRED"
     return report, rows
 
@@ -312,6 +368,8 @@ def main(argv=None):
     parser.add_argument("--data-root", type=Path, help="Main scanner data folder; auto-detected by default")
     parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
     parser.add_argument("--output", type=Path, help="Optional results ZIP path")
+    parser.add_argument("--fetch-missing-splits", action="store_true",
+                        help="Use local API credentials to create absent split caches; never refresh existing files")
     args = parser.parse_args(argv)
     if (not args.tickers or len(args.tickers) != len(set(args.tickers)) or "SPY" in args.tickers
             or any(not t or any(c in t for c in "/\\\0") or t != t.strip() for t in args.tickers)):
@@ -321,12 +379,23 @@ def main(argv=None):
     try:
         root = data_root(args.data_root)
         print(f"Using data folder: {root}", flush=True)
+        if not (root / OBSERVATIONS).is_file() or not (root / "flatfiles/day_aggs").is_dir():
+            raise FileNotFoundError("Missing master observations CSV or day_aggs folder")
+        fetched = fetch_missing_splits(root, args.tickers) if args.fetch_missing_splits else []
         report, rows = run(root, args.tickers)
+        report["missing_split_fetches"] = fetched
     except (OSError, ValueError, TypeError) as error:
         report, rows = {"status": "BLOCKED", "performance_ready": False, "error": str(error)}, []
     write_bundle(report, rows, output)
     for basis, counts in report.get("signals", {}).items():
-        print(f"{basis}: {counts['signals']} signals; {counts['anomaly_tagged']} anomaly-tagged")
+        if counts["status"] == "blocked":
+            print(f"{basis}: NOT RUN - {report['signal_errors'].get(basis, 'No tickers could be evaluated')}")
+        else:
+            print(f"{basis} ({counts['status']}): {counts['signals']} signals; {counts['anomaly_tagged']} anomaly-tagged")
+    for attempt in report.get("missing_split_fetches", []):
+        if attempt["status"] in {"blocked", "failed", "rejected"}:
+            print(f"Split cache fetch: {attempt.get('ticker', '')} {attempt['status']} "
+                  f"({attempt.get('reason') or attempt.get('error_type') or 'Cache rejected'})")
     if report.get("error") or report.get("observation_error"):
         print(report.get("error") or report["observation_error"])
     print(f"Status: {report['status']}. Diagnostic only; no performance claim.")
