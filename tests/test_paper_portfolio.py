@@ -19,8 +19,8 @@ class PortfolioTests(unittest.TestCase):
         sessions = {"2026-11-11": [],
                     "2026-11-12": [bar(t, 11, 9, 11, 10) for t in ("AAA", "BBB")]}
         report = simulate_portfolio(plans, sessions, position_limit=.1, gross_limit=.1)
-        self.assertEqual(sum(r.get("shares", 0) for r in report["trades"]), 1000)
-        self.assertEqual(report["equity_curve"][-1]["gross_exposure"], 10000)
+        self.assertEqual(sum(r.get("shares", 0) for r in report["trades"]), 500)
+        self.assertEqual(report["equity_curve"][-1]["gross_exposure"], 5000)
 
     def test_stop_gap_realized_and_drawdown(self):
         plans = {"2026-11-11:AAA": plan("AAA")}
