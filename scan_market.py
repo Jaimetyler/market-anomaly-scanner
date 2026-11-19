@@ -1,5 +1,6 @@
 import argparse
 from datetime import date, timedelta
+from pathlib import Path
 
 from scanner.classifier import classify_setup
 from scanner.data import get_daily_bars
@@ -15,6 +16,7 @@ from scanner.live_research import (
     load_promoted_archetype_members,
     match_live_snapshot,
 )
+from scanner.paper_watchlist import update_paper_watchlist
 from scanner.universe import get_active_stock_universe
 
 
@@ -131,6 +133,10 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--paper-plan", type=Path, metavar="LEDGER",
+        help="Write and review a next-session paper short plan in a JSON ledger.",
+    )
     args = parser.parse_args()
 
     print()
@@ -240,6 +246,8 @@ def main():
     )
 
     if grouped_df.empty:
+        if args.paper_plan is not None:
+            update_paper_watchlist(args.paper_plan, sessions, [])
         print(
             "No eligible grouped market data remained "
             "after universe filtering."
@@ -281,6 +289,8 @@ def main():
     )
 
     if not prefiltered:
+        if args.paper_plan is not None:
+            update_paper_watchlist(args.paper_plan, sessions, [])
         print()
         print(
             "No stocks passed the grouped-market "
@@ -304,7 +314,7 @@ def main():
     # 6. Deep analysis + research matching
     # --------------------------------------------------
 
-    end_date = date.today()
+    end_date = date.fromisoformat(session_dates[-1])
 
     start_date = (
         end_date
@@ -433,13 +443,16 @@ def main():
         reverse=True,
     )
 
+    if args.paper_plan is not None:
+        update_paper_watchlist(args.paper_plan, sessions, results[:args.show])
+
     # --------------------------------------------------
     # 8. Display ranked anomalies
     # --------------------------------------------------
 
     print()
     print("=" * 170)
-    print("VALIDATED LIVE ANOMALIES")
+    print("MARKET ANOMALY WATCHLIST")
     print("=" * 170)
 
     if not results:
